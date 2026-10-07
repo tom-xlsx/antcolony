@@ -7,18 +7,30 @@ use std::f32::consts::PI;
 pub struct Config {
     /// Starting ants. `None` scales with the world area.
     pub ants: Option<usize>,
+    /// Food piles kept in the world at once.
+    pub food_piles: usize,
+    /// Spawn more ants as food comes in.
+    pub grow: bool,
+    pub max_ants: usize,
     pub seed: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { ants: None, seed: 1 }
+        Self {
+            ants: None,
+            food_piles: 3,
+            grow: true,
+            max_ants: 200,
+            seed: 1,
+        }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Foraging,
+    Returning,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +41,9 @@ pub struct Ant {
     pub state: State,
     /// Index into `World::nests`.
     pub home: usize,
+    /// How strongly this ant lays pheromone. Starts at 1 on each pickup or delivery
+    /// and fades with distance, so long aimless wanders leave only faint marks.
+    strength: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -48,18 +63,50 @@ impl Nest {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Food {
+    pub x: f32,
+    pub y: f32,
+    pub units: u32,
+}
+
+impl Food {
+    pub fn radius(&self) -> f32 {
+        0.6 + 0.18 * (self.units as f32).sqrt()
+    }
+}
+
 pub struct World {
     pub w: usize,
     pub h: usize,
     pub nests: Vec<Nest>,
     pub ants: Vec<Ant>,
+    pub food: Vec<Food>,
+    /// "A nest is this way." Laid by foraging ants, followed by returning ones.
+    pub home_ph: Vec<f32>,
+    /// "Food is this way." Laid by returning ants, followed by foraging ones.
+    pub food_ph: Vec<f32>,
     pub tick: u64,
+    pub delivered: u64,
+    food_respawn: u32,
     cfg: Config,
     rng: fastrand::Rng,
 }
 
 const STEP: f32 = 0.35;
-const JITTER: f32 = 0.35;
+const JITTER: f32 = 0.22;
+const SENSOR_DIST: f32 = 3.0;
+const SENSOR_ANGLE: f32 = 0.55;
+const TURN: f32 = 0.45;
+const VISION: f32 = 6.0;
+const DEPOSIT: f32 = 0.06;
+const STRENGTH_DECAY: f32 = 0.995;
+const EVAPORATION: f32 = 0.993;
+const BLUR_EVERY: u64 = 3;
+const PICKUP_SLACK: f32 = 0.6;
+const GROW_EVERY: u64 = 10;
+const FOOD_RESPAWN_TICKS: u32 = 150;
+const FOOD_NEST_CLEARANCE: f32 = 8.0;
 
 impl World {
     pub fn new(cfg: Config, w: usize, h: usize) -> Self {
@@ -81,12 +128,20 @@ impl World {
             h,
             nests: vec![nest],
             ants: Vec::with_capacity(n_ants),
+            food: Vec::new(),
+            home_ph: vec![0.0; w * h],
+            food_ph: vec![0.0; w * h],
             tick: 0,
+            delivered: 0,
+            food_respawn: 0,
             cfg,
             rng,
         };
         for _ in 0..n_ants {
             world.spawn_ant(0);
+        }
+        for _ in 0..world.cfg.food_piles {
+            world.spawn_food();
         }
         world
     }
@@ -106,7 +161,35 @@ impl World {
             heading,
             state: State::Foraging,
             home,
+            strength: 1.0,
         });
+    }
+
+    /// Drop a new pile somewhere clear of nests and other food. Gives up quietly if the
+    /// world is too small to find a spot.
+    fn spawn_food(&mut self) {
+        let units = self.rng.u32(100..=260);
+        for _ in 0..40 {
+            let x = 2.0 + self.rng.f32() * (self.w as f32 - 4.0);
+            let y = 2.0 + self.rng.f32() * (self.h as f32 - 4.0);
+            let clear_of_nests = self
+                .nests
+                .iter()
+                .all(|n| dist(x, y, n.x, n.y) > n.radius() + FOOD_NEST_CLEARANCE);
+            let clear_of_food = self.food.iter().all(|f| dist(x, y, f.x, f.y) > f.radius() + 4.0);
+            if clear_of_nests && clear_of_food {
+                self.food.push(Food { x, y, units });
+                return;
+            }
+        }
+    }
+
+    /// Drop a pile at an exact spot (mouse click, `f` key).
+    pub fn add_food_at(&mut self, x: f32, y: f32) {
+        let units = self.rng.u32(80..=160);
+        let x = x.clamp(0.0, self.w as f32 - 1.0);
+        let y = y.clamp(0.0, self.h as f32 - 1.0);
+        self.food.push(Food { x, y, units });
     }
 
     pub fn tick(&mut self) {
@@ -114,24 +197,311 @@ impl World {
         for i in 0..self.ants.len() {
             self.step_ant(i);
         }
+        self.evaporate();
+        if self.tick % BLUR_EVERY == 0 {
+            blur(&mut self.home_ph, self.w, self.h);
+            blur(&mut self.food_ph, self.w, self.h);
+        }
+        self.food.retain(|f| f.units > 0);
+        if self.food.len() < self.cfg.food_piles {
+            if self.food_respawn == 0 {
+                self.spawn_food();
+                self.food_respawn = FOOD_RESPAWN_TICKS;
+            } else {
+                self.food_respawn -= 1;
+            }
+        }
     }
 
     fn step_ant(&mut self, i: usize) {
-        let w = self.w as f32;
-        let h = self.h as f32;
-        let ant = &mut self.ants[i];
-        ant.heading += (self.rng.f32() - 0.5) * 2.0 * JITTER;
-        let mut nx = ant.x + ant.heading.cos() * STEP;
-        let mut ny = ant.y + ant.heading.sin() * STEP;
+        let (w, h) = (self.w as f32, self.h as f32);
+        let ant = self.ants[i].clone();
+        let mut heading = ant.heading;
+
+        // Steer: something in sight beats the trail, the trail beats wandering.
+        let target = match ant.state {
+            State::Foraging => self
+                .food
+                .iter()
+                .map(|f| (f.x, f.y, dist(ant.x, ant.y, f.x, f.y) - f.radius()))
+                .filter(|&(_, _, d)| d < VISION)
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(x, y, _)| (x, y)),
+            State::Returning => self
+                .nests
+                .iter()
+                .map(|n| (n.x, n.y, dist(ant.x, ant.y, n.x, n.y) - n.radius()))
+                .filter(|&(_, _, d)| d < VISION * 1.5)
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(x, y, _)| (x, y)),
+        };
+        if let Some((tx, ty)) = target {
+            let want = (ty - ant.y).atan2(tx - ant.x);
+            heading += angle_diff(heading, want).clamp(-TURN * 1.5, TURN * 1.5);
+        } else {
+            let grid = match ant.state {
+                State::Foraging => &self.food_ph,
+                State::Returning => &self.home_ph,
+            };
+            let l = self.sample(grid, ant.x, ant.y, heading - SENSOR_ANGLE);
+            let c = self.sample(grid, ant.x, ant.y, heading);
+            let r = self.sample(grid, ant.x, ant.y, heading + SENSOR_ANGLE);
+            if l.max(c).max(r) > 0.01 {
+                if c >= l && c >= r {
+                    // keep going
+                } else if l > r {
+                    heading -= TURN;
+                } else {
+                    heading += TURN;
+                }
+            }
+        }
+        heading += (self.rng.f32() - 0.5) * 2.0 * JITTER;
+
+        // Move, bouncing off the edges.
+        let mut nx = ant.x + heading.cos() * STEP;
+        let mut ny = ant.y + heading.sin() * STEP;
         if nx < 0.0 || nx >= w {
-            ant.heading = PI - ant.heading;
+            heading = PI - heading;
             nx = nx.clamp(0.0, w - 0.001);
         }
         if ny < 0.0 || ny >= h {
-            ant.heading = -ant.heading;
+            heading = -heading;
             ny = ny.clamp(0.0, h - 0.001);
         }
+
+        // Lay pheromone where we are.
+        let idx = ny as usize * self.w + nx as usize;
+        let grid = match ant.state {
+            State::Foraging => &mut self.home_ph,
+            State::Returning => &mut self.food_ph,
+        };
+        grid[idx] = (grid[idx] + DEPOSIT * ant.strength).min(1.0);
+        let mut strength = ant.strength * STRENGTH_DECAY;
+        let mut state = ant.state;
+        let mut home = ant.home;
+
+        // Pick up or deliver.
+        match state {
+            State::Foraging => {
+                if let Some(f) = self
+                    .food
+                    .iter_mut()
+                    .find(|f| f.units > 0 && dist(nx, ny, f.x, f.y) <= f.radius() + PICKUP_SLACK)
+                {
+                    f.units -= 1;
+                    state = State::Returning;
+                    strength = 1.0;
+                    heading += PI;
+                }
+            }
+            State::Returning => {
+                if let Some(n) = self
+                    .nests
+                    .iter()
+                    .position(|n| dist(nx, ny, n.x, n.y) <= n.radius() + PICKUP_SLACK)
+                {
+                    self.deliver(n);
+                    home = n;
+                    state = State::Foraging;
+                    strength = 1.0;
+                    heading += PI;
+                }
+            }
+        }
+
+        let ant = &mut self.ants[i];
         ant.x = nx;
         ant.y = ny;
+        ant.heading = heading.rem_euclid(2.0 * PI);
+        ant.state = state;
+        ant.strength = strength;
+        ant.home = home;
+    }
+
+    fn deliver(&mut self, nest: usize) {
+        self.delivered += 1;
+        let n = &mut self.nests[nest];
+        n.delivered += 1;
+        if self.cfg.grow && n.delivered % GROW_EVERY == 0 && self.ants.len() < self.cfg.max_ants {
+            n.population += 1;
+            self.spawn_ant(nest);
+        }
+    }
+
+    fn sample(&self, grid: &[f32], x: f32, y: f32, angle: f32) -> f32 {
+        let sx = x + angle.cos() * SENSOR_DIST;
+        let sy = y + angle.sin() * SENSOR_DIST;
+        if sx < 0.0 || sy < 0.0 || sx >= self.w as f32 || sy >= self.h as f32 {
+            return 0.0;
+        }
+        grid[sy as usize * self.w + sx as usize]
+    }
+
+    fn evaporate(&mut self) {
+        for grid in [&mut self.home_ph, &mut self.food_ph] {
+            for v in grid.iter_mut() {
+                *v *= EVAPORATION;
+                if *v < 0.001 {
+                    *v = 0.0;
+                }
+            }
+        }
+    }
+
+    /// Plain-text picture of the world, one char per pixel, for tests and `--headless`.
+    pub fn snapshot(&self) -> String {
+        let mut out = String::with_capacity((self.w + 1) * self.h);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                let ant = self.ants.iter().find(|a| a.x as usize == x && a.y as usize == y);
+                let ch = if let Some(a) = ant {
+                    match a.state {
+                        State::Returning => 'A',
+                        State::Foraging => 'a',
+                    }
+                } else if self.nests.iter().any(|n| dist(fx, fy, n.x, n.y) <= n.radius()) {
+                    'N'
+                } else if self.food.iter().any(|f| dist(fx, fy, f.x, f.y) <= f.radius()) {
+                    'F'
+                } else {
+                    let p = self.home_ph[y * self.w + x].max(self.food_ph[y * self.w + x]);
+                    if p > 0.3 {
+                        '#'
+                    } else if p > 0.08 {
+                        ':'
+                    } else if p > 0.015 {
+                        '.'
+                    } else {
+                        ' '
+                    }
+                };
+                out.push(ch);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    pub fn stats(&self) -> String {
+        format!(
+            "tick {} · nests {} · ants {} · food {} piles · delivered {}",
+            self.tick,
+            self.nests.len(),
+            self.ants.len(),
+            self.food.len(),
+            self.delivered
+        )
+    }
+}
+
+fn dist(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
+}
+
+/// Signed shortest rotation from `from` to `to`, in -PI..=PI.
+fn angle_diff(from: f32, to: f32) -> f32 {
+    let d = (to - from).rem_euclid(2.0 * PI);
+    if d > PI {
+        d - 2.0 * PI
+    } else {
+        d
+    }
+}
+
+/// Cheap 4-neighbour blur, mass-preserving in the interior, so trails spread a little.
+fn blur(grid: &mut [f32], w: usize, h: usize) {
+    if w < 3 || h < 3 {
+        return;
+    }
+    let src = grid.to_vec();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            let sum = src[i - 1] + src[i + 1] + src[i - w] + src[i + w];
+            grid[i] = src[i] * 0.85 + sum * 0.0375;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn world() -> World {
+        World::new(
+            Config {
+                ants: Some(10),
+                food_piles: 0,
+                ..Config::default()
+            },
+            40,
+            30,
+        )
+    }
+
+    #[test]
+    fn ant_next_to_food_picks_it_up_and_turns_home() {
+        let mut w = world();
+        w.food.push(Food { x: 10.0, y: 10.0, units: 5 });
+        w.ants[0] = Ant { x: 10.5, y: 10.0, heading: 0.0, state: State::Foraging, home: 0, strength: 0.2 };
+        w.step_ant(0);
+        assert_eq!(w.ants[0].state, State::Returning);
+        assert_eq!(w.food[0].units, 4);
+        assert_eq!(w.ants[0].strength, 1.0);
+    }
+
+    #[test]
+    fn returning_ant_at_nest_delivers() {
+        let mut w = world();
+        let (nx, ny) = (w.nests[0].x, w.nests[0].y);
+        w.ants[0] = Ant { x: nx, y: ny, heading: 0.0, state: State::Returning, home: 0, strength: 0.5 };
+        w.step_ant(0);
+        assert_eq!(w.ants[0].state, State::Foraging);
+        assert_eq!(w.delivered, 1);
+        assert_eq!(w.nests[0].delivered, 1);
+    }
+
+    #[test]
+    fn pheromone_evaporates_to_nothing() {
+        let mut w = world();
+        w.home_ph[5] = 1.0;
+        for _ in 0..2000 {
+            w.evaporate();
+        }
+        assert_eq!(w.home_ph[5], 0.0);
+    }
+
+    #[test]
+    fn growth_spawns_an_ant_every_few_deliveries() {
+        let mut w = world();
+        for _ in 0..GROW_EVERY {
+            w.deliver(0);
+        }
+        assert_eq!(w.ants.len(), 11);
+        assert_eq!(w.nests[0].population, 11);
+    }
+
+    #[test]
+    fn tiny_and_odd_sizes_do_not_panic() {
+        for (cw, ch) in [(1, 1), (4, 4), (5, 3), (71, 48), (200, 7)] {
+            let mut w = World::new(Config::default(), cw, ch);
+            for _ in 0..50 {
+                w.tick();
+            }
+            let _ = w.snapshot();
+        }
+    }
+
+    #[test]
+    fn trails_form_between_nest_and_food() {
+        let mut w = World::new(Config { seed: 7, ..Config::default() }, 71, 48);
+        for _ in 0..3000 {
+            w.tick();
+        }
+        assert!(w.delivered > 20, "only {} deliveries:\n{}", w.delivered, w.snapshot());
+        let strong = w.food_ph.iter().filter(|&&v| v > 0.08).count();
+        assert!(strong > 30, "no real food trail ({strong} cells):\n{}", w.snapshot());
     }
 }

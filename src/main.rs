@@ -20,9 +20,27 @@ struct Args {
     /// Random seed. Same seed and pane size gives the same colony.
     #[arg(long)]
     seed: Option<u64>,
+    /// Food piles kept in the world at once.
+    #[arg(long, default_value_t = 3)]
+    food: usize,
+    /// Don't spawn new ants as food comes in.
+    #[arg(long)]
+    no_grow: bool,
     /// Hide the status line.
     #[arg(long, short)]
     quiet: bool,
+    /// Run this many ticks with no terminal, print a text snapshot and stats, and exit.
+    #[arg(long, value_name = "TICKS")]
+    headless: Option<u64>,
+    /// World size for --headless as COLSxROWS (terminal cells).
+    #[arg(long, default_value = "71x24", value_parser = parse_size)]
+    size: (usize, usize),
+}
+
+fn parse_size(s: &str) -> Result<(usize, usize), String> {
+    let (w, h) = s.split_once('x').ok_or("expected COLSxROWS, e.g. 71x24")?;
+    let p = |v: &str| v.trim().parse::<usize>().map_err(|e| e.to_string());
+    Ok((p(w)?, p(h)?))
 }
 
 const FRAME: Duration = Duration::from_millis(33);
@@ -31,8 +49,21 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
     let cfg = Config {
         ants: args.ants,
+        food_piles: args.food,
+        grow: !args.no_grow,
         seed: args.seed.unwrap_or_else(|| fastrand::u64(..)),
+        ..Config::default()
     };
+
+    if let Some(ticks) = args.headless {
+        let mut world = World::new(cfg, args.size.0, args.size.1 * 2);
+        for _ in 0..ticks {
+            world.tick();
+        }
+        print!("{}", world.snapshot());
+        println!("{}", world.stats());
+        return Ok(());
+    }
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, cfg, !args.quiet);
@@ -50,7 +81,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, cfg: Config, mut show_status: bo
         if now >= next_frame {
             world.tick();
             terminal.draw(|frame| {
-                let status = show_status.then(|| format!("ants {} ", world.ants.len()));
+                let status = show_status.then(|| format!("{} ", world.stats()));
                 frame.render_widget(ui::Colony { world: &world, status }, frame.area());
             })?;
             next_frame = now + FRAME;
@@ -64,6 +95,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, cfg: Config, mut show_status: bo
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
                 KeyCode::Char('h') => show_status = !show_status,
+                KeyCode::Char('f') => {
+                    let (x, y) = (fastrand::f32() * world.w as f32, fastrand::f32() * world.h as f32);
+                    world.add_food_at(x, y);
+                }
                 _ => {}
             },
             Event::Resize(w, h) => {
