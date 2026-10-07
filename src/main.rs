@@ -79,7 +79,8 @@ fn setup_terminal() -> io::Result<Term> {
     let backend = CrosstermBackend::new(BufWriter::with_capacity(1 << 20, stdout()));
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
-    terminal.clear()?;
+    // No `terminal.clear()` here: it asks the terminal for the cursor position and bails
+    // out if the reply is slow (zellij), and the first frame paints every cell anyway.
     Ok(terminal)
 }
 
