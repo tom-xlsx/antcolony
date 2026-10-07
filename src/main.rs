@@ -2,22 +2,28 @@ mod palette;
 mod sim;
 mod ui;
 
-use std::io::{self, stdout};
+use std::io::{self, stdout, BufWriter, Stdout};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::Terminal;
 
 use sim::{Config, World};
 
 /// An ant colony that lives in a terminal pane.
 ///
 /// Keys: q quit · space pause · r reset · + / - speed · f drop food · h status line.
-/// Click anywhere to drop food there.
+/// Click anywhere to drop food on the surface at that column.
 #[derive(Parser, Debug)]
 #[command(version, about, verbatim_doc_comment)]
 struct Args {
@@ -30,16 +36,16 @@ struct Args {
     /// Random seed. Same seed and pane size gives the same colony.
     #[arg(long)]
     seed: Option<u64>,
-    /// Food piles kept in the world at once.
+    /// Food piles kept on the surface at once.
     #[arg(long, default_value_t = 3)]
     food: usize,
-    /// Don't spawn new ants as food comes in (also stops nests growing and budding).
+    /// Fixed population: stored food never turns into new ants (also stops budding).
     #[arg(long)]
     no_grow: bool,
-    /// Don't let crowded nests send out founding parties.
+    /// Don't let a big colony send out a party to open a new nest.
     #[arg(long)]
     no_bud: bool,
-    /// Most nests allowed at once.
+    /// Most nest entrances allowed at once.
     #[arg(long, default_value_t = 4)]
     max_nests: usize,
     /// Hide the status line.
@@ -61,7 +67,26 @@ fn parse_size(s: &str) -> Result<(usize, usize), String> {
 
 /// Ticks per frame at each speed level (index = level - 1). Level 1 also halves the frame rate.
 const SPEEDS: [u32; 8] = [1, 1, 2, 3, 4, 6, 8, 12];
-const FRAME: Duration = Duration::from_millis(33);
+const FRAME: Duration = Duration::from_millis(40);
+
+type Term = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
+/// Raw mode, alternate screen, mouse reporting, and a 1 MiB write buffer so each frame
+/// reaches the terminal in one write instead of a thousand small ones.
+fn setup_terminal() -> io::Result<Term> {
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(BufWriter::with_capacity(1 << 20, stdout()));
+    let mut terminal = Terminal::new(backend)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    Ok(terminal)
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
+}
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
@@ -85,19 +110,17 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // ratatui::init installs a panic hook that restores the terminal; wrap it so mouse
-    // reporting is switched off too, or a crash leaves the pane spraying escape codes on clicks.
-    let mut terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture)?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture);
+        restore_terminal();
         hook(info);
     }));
-
+    let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, cfg, args.speed, !args.quiet);
-    let _ = execute!(stdout(), DisableMouseCapture);
-    ratatui::restore();
+    restore_terminal();
+    if let Err(e) = &result {
+        eprintln!("antcolony: {e}");
+    }
     result
 }
 
@@ -116,11 +139,12 @@ impl App {
         }
         let w = &self.world;
         let mut s = format!(
-            "nests {} · ants {} · food {} · delivered {} · x{} ",
-            w.nests.len(),
+            "nests {} · ants {} · dug {} · stored {} · food {} · x{} ",
+            w.entrances.len(),
             w.ants.len(),
+            w.dug,
+            w.stored(),
             w.food.len(),
-            w.delivered,
             self.speed
         );
         if self.paused {
@@ -134,7 +158,7 @@ impl App {
     }
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, cfg: Config, speed: u8, show_status: bool) -> io::Result<()> {
+fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Result<()> {
     let size = terminal.size()?;
     let mut app = App {
         world: World::new(cfg.clone(), size.width as usize, size.height as usize * 2),
@@ -160,10 +184,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, cfg: Config, speed: u8, show_sta
             next_frame = now + if app.speed == 1 { FRAME * 2 } else { FRAME };
         }
         let wait = next_frame.saturating_duration_since(Instant::now());
-        if !event::poll(wait)? {
+        // Input the parser can't make sense of (odd terminal replies, exotic mouse modes)
+        // comes back as an error from crossterm. That is never a reason to quit.
+        if !event::poll(wait).unwrap_or(false) {
             continue;
         }
-        match event::read()? {
+        let Ok(ev) = event::read() else { continue };
+        match ev {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
@@ -177,13 +204,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, cfg: Config, speed: u8, show_sta
                     app.rebuild(size.width, size.height);
                 }
                 KeyCode::Char('f') => {
-                    let (x, y) = (fastrand::f32() * app.world.w as f32, fastrand::f32() * app.world.h as f32);
-                    app.world.add_food_at(x, y);
+                    let x = fastrand::usize(..app.world.w);
+                    app.world.add_food_at(x);
                 }
                 _ => {}
             },
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-                app.world.add_food_at(m.column as f32 + 0.5, m.row as f32 * 2.0 + 1.0);
+                app.world.add_food_at(m.column as usize);
             }
             Event::Resize(w, h) => app.rebuild(w, h),
             _ => {}

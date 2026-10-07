@@ -1,5 +1,8 @@
 //! Draws a `World` into a ratatui buffer. Each terminal cell is two stacked pixels:
 //! `▀` with the foreground as the top pixel and the background as the bottom one.
+//!
+//! Colours are kept stable frame to frame wherever nothing moved (soil texture comes
+//! from a hash, trail brightness is quantised), so the terminal diff stays small.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -7,67 +10,98 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
 use crate::palette::{self, Rgb};
-use crate::sim::{State, World};
+use crate::sim::{Cell, State, World};
 
 pub struct Colony<'a> {
     pub world: &'a World,
     pub status: Option<String>,
 }
 
-/// Flat RGB pixel buffer the size of the world, painted in priority order.
+/// Cheap stable per-pixel noise.
+fn hash(x: usize, y: usize) -> u32 {
+    let mut h = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h
+}
+
+const STORE_CAP: f32 = 6.0;
+
+/// Flat RGB pixel buffer the size of the world.
 pub fn paint(world: &World) -> Vec<Rgb> {
     let (w, h) = (world.w, world.h);
-    let mut px: Vec<Rgb> = (0..w * h)
-        .map(|i| palette::trail(world.home_ph[i], world.food_ph[i]))
-        .collect();
+    let mut px = vec![palette::SKY; w * h];
 
-    for nest in &world.nests {
-        let r = nest.radius();
-        let mut rng = fastrand::Rng::with_seed(nest.texture_seed);
-        let x0 = (nest.x - r - 1.0).max(0.0) as usize;
-        let y0 = (nest.y - r - 1.0).max(0.0) as usize;
-        let x1 = ((nest.x + r + 1.0) as usize).min(w - 1);
-        let y1 = ((nest.y + r + 1.0) as usize).min(h - 1);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let d = ((x as f32 + 0.5 - nest.x).powi(2) + (y as f32 + 0.5 - nest.y).powi(2)).sqrt();
-                if d > r {
-                    continue;
+    for y in 0..h {
+        for x in 0..w {
+            let n = hash(x, y);
+            let ground = world.ground[x];
+            let c = match world.cell(x, y) {
+                Cell::Sky => {
+                    if y + 1 == ground {
+                        // Surface strip: grass tufts and the foraging trail.
+                        let base = if n % 100 < 12 { palette::GRASS } else { palette::SKY };
+                        let t = (world.surf_ph[x].min(1.0) * 6.0).round() / 6.0;
+                        if t > 0.0 {
+                            palette::lerp(base, palette::TRAIL, 0.15 + 0.6 * t)
+                        } else {
+                            base
+                        }
+                    } else if n % 1000 < 5 {
+                        palette::STAR
+                    } else {
+                        palette::SKY
+                    }
                 }
-                px[y * w + x] = if d > r - 1.0 {
-                    palette::NEST_RIM
-                } else if rng.u8(..) < 60 {
-                    palette::NEST_CHAMBER
-                } else {
-                    palette::NEST
-                };
-            }
+                Cell::Soil => {
+                    let depth = y.saturating_sub(ground) as i16;
+                    let var = (n % 17) as i16 - 8;
+                    if n % 100 < 4 {
+                        palette::shade(palette::PEBBLE, var - depth.min(30) / 2)
+                    } else {
+                        palette::shade(palette::SOIL, var - depth.min(30))
+                    }
+                }
+                Cell::Tunnel => palette::TUNNEL,
+                Cell::Chamber => {
+                    let s = world.store[y * w + x] as f32;
+                    palette::lerp(palette::CHAMBER, palette::FOOD, s / STORE_CAP)
+                }
+            };
+            px[y * w + x] = c;
         }
     }
 
     for food in &world.food {
-        let r = food.radius();
-        let x0 = (food.x - r - 1.0).max(0.0) as usize;
-        let y0 = (food.y - r - 1.0).max(0.0) as usize;
-        let x1 = ((food.x + r + 1.0) as usize).min(w - 1);
-        let y1 = ((food.y + r + 1.0) as usize).min(h - 1);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let d = ((x as f32 + 0.5 - food.x).powi(2) + (y as f32 + 0.5 - food.y).powi(2)).sqrt();
-                if d <= r {
-                    px[y * w + x] = palette::FOOD;
-                }
+        let gy = world.ground[food.x];
+        let mut put = |x: i32, y: i32| {
+            if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+                px[y as usize * w + x as usize] = palette::FOOD;
             }
+        };
+        let (x, y) = (food.x as i32, gy as i32 - 1);
+        put(x, y);
+        if food.units > 20 {
+            put(x, y - 1);
+        }
+        if food.units > 45 {
+            put(x - 1, y);
+            put(x + 1, y);
+        }
+        if food.units > 70 {
+            put(x - 1, y - 1);
+            put(x + 1, y - 1);
         }
     }
 
     for ant in &world.ants {
-        let (x, y) = (ant.x as usize, ant.y as usize);
-        if x < w && y < h {
-            px[y * w + x] = match ant.state {
-                State::Foraging => palette::ANT,
+        if ant.x < w && ant.y < h {
+            px[ant.y * w + ant.x] = match ant.state {
                 State::Returning => palette::ANT_CARRYING,
-                State::Founding => palette::ANT_FOUNDING,
+                State::Digging => palette::ANT_DIGGING,
+                State::Founding(_) => palette::ANT_FOUNDING,
+                State::Foraging | State::ToTip => palette::ANT,
             };
         }
     }
@@ -107,9 +141,7 @@ impl Widget for Colony<'_> {
                     x,
                     y,
                     &text,
-                    Style::default()
-                        .fg(color(palette::STATUS))
-                        .bg(color(palette::BACKGROUND)),
+                    Style::default().fg(color(palette::STATUS)).bg(color(palette::STATUS_BG)),
                 );
             }
         }
