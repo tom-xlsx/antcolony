@@ -5,6 +5,7 @@ pub type Rgb = (u8, u8, u8);
 pub const BACKGROUND: Rgb = (22, 20, 18);
 pub const ANT: Rgb = (236, 232, 220);
 pub const ANT_CARRYING: Rgb = (190, 240, 150);
+pub const ANT_FOUNDING: Rgb = (255, 196, 110);
 pub const FOOD: Rgb = (92, 200, 72);
 pub const NEST: Rgb = (96, 66, 42);
 pub const NEST_RIM: Rgb = (134, 98, 62);

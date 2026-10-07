@@ -7,7 +7,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
 use crate::palette::{self, Rgb};
-use crate::sim::World;
+use crate::sim::{State, World};
 
 pub struct Colony<'a> {
     pub world: &'a World,
@@ -17,7 +17,9 @@ pub struct Colony<'a> {
 /// Flat RGB pixel buffer the size of the world, painted in priority order.
 pub fn paint(world: &World) -> Vec<Rgb> {
     let (w, h) = (world.w, world.h);
-    let mut px = vec![palette::BACKGROUND; w * h];
+    let mut px: Vec<Rgb> = (0..w * h)
+        .map(|i| palette::trail(world.home_ph[i], world.food_ph[i]))
+        .collect();
 
     for nest in &world.nests {
         let r = nest.radius();
@@ -43,10 +45,30 @@ pub fn paint(world: &World) -> Vec<Rgb> {
         }
     }
 
+    for food in &world.food {
+        let r = food.radius();
+        let x0 = (food.x - r - 1.0).max(0.0) as usize;
+        let y0 = (food.y - r - 1.0).max(0.0) as usize;
+        let x1 = ((food.x + r + 1.0) as usize).min(w - 1);
+        let y1 = ((food.y + r + 1.0) as usize).min(h - 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let d = ((x as f32 + 0.5 - food.x).powi(2) + (y as f32 + 0.5 - food.y).powi(2)).sqrt();
+                if d <= r {
+                    px[y * w + x] = palette::FOOD;
+                }
+            }
+        }
+    }
+
     for ant in &world.ants {
         let (x, y) = (ant.x as usize, ant.y as usize);
         if x < w && y < h {
-            px[y * w + x] = palette::ANT;
+            px[y * w + x] = match ant.state {
+                State::Foraging => palette::ANT,
+                State::Returning => palette::ANT_CARRYING,
+                State::Founding => palette::ANT_FOUNDING,
+            };
         }
     }
     px

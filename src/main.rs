@@ -23,9 +23,15 @@ struct Args {
     /// Food piles kept in the world at once.
     #[arg(long, default_value_t = 3)]
     food: usize,
-    /// Don't spawn new ants as food comes in.
+    /// Don't spawn new ants as food comes in (also stops nests growing and budding).
     #[arg(long)]
     no_grow: bool,
+    /// Don't let crowded nests send out founding parties.
+    #[arg(long)]
+    no_bud: bool,
+    /// Most nests allowed at once.
+    #[arg(long, default_value_t = 4)]
+    max_nests: usize,
     /// Hide the status line.
     #[arg(long, short)]
     quiet: bool,
@@ -51,6 +57,8 @@ fn main() -> io::Result<()> {
         ants: args.ants,
         food_piles: args.food,
         grow: !args.no_grow,
+        bud: !args.no_bud && !args.no_grow,
+        max_nests: args.max_nests.max(1),
         seed: args.seed.unwrap_or_else(|| fastrand::u64(..)),
         ..Config::default()
     };

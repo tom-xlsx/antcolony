@@ -12,6 +12,9 @@ pub struct Config {
     /// Spawn more ants as food comes in.
     pub grow: bool,
     pub max_ants: usize,
+    /// Let a crowded nest send out a founding party to dig a new one.
+    pub bud: bool,
+    pub max_nests: usize,
     pub seed: u64,
 }
 
@@ -22,6 +25,8 @@ impl Default for Config {
             food_piles: 3,
             grow: true,
             max_ants: 200,
+            bud: true,
+            max_nests: 4,
             seed: 1,
         }
     }
@@ -31,6 +36,8 @@ impl Default for Config {
 pub enum State {
     Foraging,
     Returning,
+    /// Marching off with a founding party to dig a new nest.
+    Founding,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +61,16 @@ pub struct Nest {
     pub delivered: u64,
     /// Seed for the stable chamber texture when drawn.
     pub texture_seed: u64,
+    bud_cooldown: u32,
+}
+
+/// A group of ants that has left a nest to found a new one. Followers trail the leader.
+#[derive(Clone, Debug)]
+pub struct Party {
+    pub leader: usize,
+    pub members: Vec<usize>,
+    pub from: usize,
+    pub steps: u32,
 }
 
 impl Nest {
@@ -86,6 +103,7 @@ pub struct World {
     pub home_ph: Vec<f32>,
     /// "Food is this way." Laid by returning ants, followed by foraging ones.
     pub food_ph: Vec<f32>,
+    pub parties: Vec<Party>,
     pub tick: u64,
     pub delivered: u64,
     food_respawn: u32,
@@ -107,6 +125,12 @@ const PICKUP_SLACK: f32 = 0.6;
 const GROW_EVERY: u64 = 10;
 const FOOD_RESPAWN_TICKS: u32 = 150;
 const FOOD_NEST_CLEARANCE: f32 = 8.0;
+const BUD_POPULATION: usize = 40;
+const BUD_PARTY: usize = 8;
+const BUD_COOLDOWN: u32 = 1200;
+const BUD_MIN_STEPS: u32 = 40;
+const BUD_GIVE_UP_STEPS: u32 = 700;
+const NEST_GAP: f32 = 10.0;
 
 impl World {
     pub fn new(cfg: Config, w: usize, h: usize) -> Self {
@@ -122,6 +146,7 @@ impl World {
             population: n_ants,
             delivered: 0,
             texture_seed: rng.u64(..),
+            bud_cooldown: BUD_COOLDOWN,
         };
         let mut world = Self {
             w,
@@ -129,6 +154,7 @@ impl World {
             nests: vec![nest],
             ants: Vec::with_capacity(n_ants),
             food: Vec::new(),
+            parties: Vec::new(),
             home_ph: vec![0.0; w * h],
             food_ph: vec![0.0; w * h],
             tick: 0,
@@ -144,10 +170,6 @@ impl World {
             world.spawn_food();
         }
         world
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.cfg
     }
 
     /// Spawn an ant on the rim of nest `home`, facing outward.
@@ -197,6 +219,10 @@ impl World {
         for i in 0..self.ants.len() {
             self.step_ant(i);
         }
+        self.settle_parties();
+        if self.cfg.bud {
+            self.maybe_bud();
+        }
         self.evaporate();
         if self.tick % BLUR_EVERY == 0 {
             blur(&mut self.home_ph, self.w, self.h);
@@ -214,12 +240,17 @@ impl World {
     }
 
     fn step_ant(&mut self, i: usize) {
+        if self.ants[i].state == State::Founding {
+            self.step_founder(i);
+            return;
+        }
         let (w, h) = (self.w as f32, self.h as f32);
         let ant = self.ants[i].clone();
         let mut heading = ant.heading;
 
         // Steer: something in sight beats the trail, the trail beats wandering.
         let target = match ant.state {
+            State::Founding => unreachable!(),
             State::Foraging => self
                 .food
                 .iter()
@@ -240,7 +271,7 @@ impl World {
             heading += angle_diff(heading, want).clamp(-TURN * 1.5, TURN * 1.5);
         } else {
             let grid = match ant.state {
-                State::Foraging => &self.food_ph,
+                State::Foraging | State::Founding => &self.food_ph,
                 State::Returning => &self.home_ph,
             };
             let l = self.sample(grid, ant.x, ant.y, heading - SENSOR_ANGLE);
@@ -273,7 +304,7 @@ impl World {
         // Lay pheromone where we are.
         let idx = ny as usize * self.w + nx as usize;
         let grid = match ant.state {
-            State::Foraging => &mut self.home_ph,
+            State::Foraging | State::Founding => &mut self.home_ph,
             State::Returning => &mut self.food_ph,
         };
         grid[idx] = (grid[idx] + DEPOSIT * ant.strength).min(1.0);
@@ -283,6 +314,7 @@ impl World {
 
         // Pick up or deliver.
         match state {
+            State::Founding => {}
             State::Foraging => {
                 if let Some(f) = self
                     .food
@@ -302,6 +334,11 @@ impl World {
                     .position(|n| dist(nx, ny, n.x, n.y) <= n.radius() + PICKUP_SLACK)
                 {
                     self.deliver(n);
+                    if n != home {
+                        // Delivered to another nest: that is home now.
+                        self.nests[home].population = self.nests[home].population.saturating_sub(1);
+                        self.nests[n].population += 1;
+                    }
                     home = n;
                     state = State::Foraging;
                     strength = 1.0;
@@ -317,6 +354,122 @@ impl World {
         ant.state = state;
         ant.strength = strength;
         ant.home = home;
+    }
+
+    /// Founders march in a loose group behind their leader and lay no trail.
+    fn step_founder(&mut self, i: usize) {
+        let (w, h) = (self.w as f32, self.h as f32);
+        let leader = self
+            .parties
+            .iter()
+            .find(|p| p.members.contains(&i))
+            .map(|p| p.leader);
+        let ant = &self.ants[i];
+        let mut heading = ant.heading;
+        match leader {
+            Some(l) if l != i => {
+                let (lx, ly) = (self.ants[l].x, self.ants[l].y);
+                if dist(ant.x, ant.y, lx, ly) > 1.5 {
+                    let want = (ly - ant.y).atan2(lx - ant.x);
+                    heading += angle_diff(heading, want).clamp(-TURN, TURN);
+                }
+                heading += (self.rng.f32() - 0.5) * 2.0 * JITTER;
+            }
+            _ => heading += (self.rng.f32() - 0.5) * 2.0 * JITTER * 0.4,
+        }
+        let ant = &mut self.ants[i];
+        let mut nx = ant.x + heading.cos() * STEP;
+        let mut ny = ant.y + heading.sin() * STEP;
+        if nx < 0.0 || nx >= w {
+            heading = PI - heading;
+            nx = nx.clamp(0.0, w - 0.001);
+        }
+        if ny < 0.0 || ny >= h {
+            heading = -heading;
+            ny = ny.clamp(0.0, h - 0.001);
+        }
+        ant.x = nx;
+        ant.y = ny;
+        ant.heading = heading.rem_euclid(2.0 * PI);
+    }
+
+    /// A crowded, established nest sends a party of foragers off to dig a new nest.
+    fn maybe_bud(&mut self) {
+        for n in 0..self.nests.len() {
+            let nest = &mut self.nests[n];
+            nest.bud_cooldown = nest.bud_cooldown.saturating_sub(1);
+            if nest.bud_cooldown > 0
+                || nest.population < BUD_POPULATION
+                || self.nests.len() + self.parties.len() >= self.cfg.max_nests
+            {
+                continue;
+            }
+            let members: Vec<usize> = self
+                .ants
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.home == n && a.state == State::Foraging)
+                .map(|(i, _)| i)
+                .take(BUD_PARTY)
+                .collect();
+            if members.len() < BUD_PARTY {
+                continue;
+            }
+            let heading = self.rng.f32() * 2.0 * PI;
+            for &i in &members {
+                let a = &mut self.ants[i];
+                a.state = State::Founding;
+                a.heading = heading;
+            }
+            self.nests[n].population -= members.len();
+            self.nests[n].bud_cooldown = BUD_COOLDOWN;
+            self.parties.push(Party { leader: members[0], members, from: n, steps: 0 });
+        }
+    }
+
+    /// Parties dig in once their leader is somewhere clear, or give up and go home.
+    fn settle_parties(&mut self) {
+        let mut p = 0;
+        while p < self.parties.len() {
+            self.parties[p].steps += 1;
+            let party = &self.parties[p];
+            let (lx, ly) = (self.ants[party.leader].x, self.ants[party.leader].y);
+            let clear = party.steps >= BUD_MIN_STEPS
+                && lx > 6.0
+                && ly > 6.0
+                && lx < self.w as f32 - 6.0
+                && ly < self.h as f32 - 6.0
+                && self.nests.iter().all(|n| dist(lx, ly, n.x, n.y) > n.radius() + NEST_GAP)
+                && self.food.iter().all(|f| dist(lx, ly, f.x, f.y) > f.radius() + 3.0);
+            if clear {
+                let party = self.parties.remove(p);
+                let idx = self.nests.len();
+                self.nests.push(Nest {
+                    x: lx,
+                    y: ly,
+                    population: party.members.len(),
+                    delivered: 0,
+                    texture_seed: self.rng.u64(..),
+                    bud_cooldown: BUD_COOLDOWN,
+                });
+                for i in party.members {
+                    let a = &mut self.ants[i];
+                    a.state = State::Foraging;
+                    a.home = idx;
+                    a.strength = 1.0;
+                }
+            } else if party.steps > BUD_GIVE_UP_STEPS {
+                let party = self.parties.remove(p);
+                self.nests[party.from].population += party.members.len();
+                for i in party.members {
+                    let a = &mut self.ants[i];
+                    a.state = State::Foraging;
+                    a.strength = 1.0;
+                }
+            } else {
+                p += 1;
+            }
+        }
     }
 
     fn deliver(&mut self, nest: usize) {
@@ -360,6 +513,7 @@ impl World {
                     match a.state {
                         State::Returning => 'A',
                         State::Foraging => 'a',
+                        State::Founding => '*',
                     }
                 } else if self.nests.iter().any(|n| dist(fx, fy, n.x, n.y) <= n.radius()) {
                     'N'
@@ -492,6 +646,34 @@ mod tests {
             }
             let _ = w.snapshot();
         }
+    }
+
+    #[test]
+    fn crowded_nest_founds_a_second_one_at_a_distance() {
+        let mut w = World::new(Config { seed: 7, ..Config::default() }, 71, 48);
+        let mut found_at = None;
+        for t in 0..8000 {
+            w.tick();
+            if w.nests.len() >= 2 {
+                found_at = Some(t);
+                break;
+            }
+        }
+        assert!(found_at.is_some(), "no second nest after 8000 ticks:\n{}", w.snapshot());
+        let (a, b) = (&w.nests[0], &w.nests[1]);
+        assert!(dist(a.x, a.y, b.x, b.y) > a.radius() + NEST_GAP);
+        assert_eq!(b.population, BUD_PARTY);
+        assert!(w.parties.is_empty());
+        assert!(w.ants.iter().all(|a| a.state != State::Founding));
+    }
+
+    #[test]
+    fn no_bud_keeps_one_nest() {
+        let mut w = World::new(Config { seed: 7, bud: false, ..Config::default() }, 71, 48);
+        for _ in 0..6000 {
+            w.tick();
+        }
+        assert_eq!(w.nests.len(), 1);
     }
 
     #[test]
