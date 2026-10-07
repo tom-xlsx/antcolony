@@ -224,7 +224,7 @@ impl World {
             self.maybe_bud();
         }
         self.evaporate();
-        if self.tick % BLUR_EVERY == 0 {
+        if self.tick.is_multiple_of(BLUR_EVERY) {
             blur(&mut self.home_ph, self.w, self.h);
             blur(&mut self.food_ph, self.w, self.h);
         }
@@ -476,7 +476,7 @@ impl World {
         self.delivered += 1;
         let n = &mut self.nests[nest];
         n.delivered += 1;
-        if self.cfg.grow && n.delivered % GROW_EVERY == 0 && self.ants.len() < self.cfg.max_ants {
+        if self.cfg.grow && n.delivered.is_multiple_of(GROW_EVERY) && self.ants.len() < self.cfg.max_ants {
             n.population += 1;
             self.spawn_ant(nest);
         }
