@@ -988,15 +988,12 @@ impl World {
             let n = self.nest_of[i];
             let decaying = n == NO_NEST || self.nests[n as usize].dead || self.nests[n as usize].queen_lost && self.nests[n as usize].queen.is_none();
             // Only the edge crumbles: cells with soil beside them, leaves first.
-            if !decaying || self.dug_neighbours(i) == 4 || self.store[i] > 0 {
+            if !decaying || self.dug_neighbours(i) == 4 {
                 continue;
             }
             let (x, y) = (i % self.w, i / self.w);
-            let occupied = self.ants.iter().any(|a| a.underground && a.x == x && a.y == y)
-                || self.eggs.iter().any(|e| e.cell == i)
-                || self.nests.iter().any(|nst| nst.queen.as_ref().is_some_and(|q| (q.x, q.y) == (x, y)));
-            if occupied {
-                continue;
+            if self.nests.iter().any(|nst| nst.queen.as_ref().is_some_and(|q| (q.x, q.y) == (x, y))) {
+                continue; // a queen's cell never crumbles under her
             }
             let is_entrance = y == self.ground[x] && self.entrances.contains(&x);
             let last = n == NO_NEST || self.nest_cells(n as usize) <= 1;
@@ -1018,10 +1015,36 @@ impl World {
                 let (x, y) = (i % w.w, i / w.w);
                 (w.dug_neighbours(i), std::cmp::Reverse(y + x.abs_diff(ex)))
             };
-            let best = cells.iter().map(|&i| key(self, i)).min().unwrap();
-            let ties: Vec<usize> = cells.iter().copied().filter(|&i| key(self, i) == best).collect();
+            // Cells with an ant or an egg on them wait, unless nothing else is left: a
+            // crumbling system must keep crumbling, so then the occupants are buried with it.
+            let occupied = |w: &Self, i: usize| {
+                let (x, y) = (i % w.w, i / w.w);
+                w.ants.iter().any(|a| a.underground && a.x == x && a.y == y) || w.eggs.iter().any(|e| e.cell == i)
+            };
+            let free: Vec<usize> = cells.iter().copied().filter(|&i| !occupied(self, i)).collect();
+            let pool = if free.is_empty() { cells } else { free };
+            let best = pool.iter().map(|&i| key(self, i)).min().unwrap();
+            let ties: Vec<usize> = pool.iter().copied().filter(|&i| key(self, i) == best).collect();
             let i = ties[self.rng.usize(..ties.len())];
             let (x, y) = (i % self.w, i / self.w);
+            if occupied(self, i) {
+                let mut k = 0;
+                while k < self.ants.len() {
+                    if self.ants[k].underground && self.ants[k].x == x && self.ants[k].y == y {
+                        self.ants.swap_remove(k);
+                        self.deaths += 1;
+                    } else {
+                        k += 1;
+                    }
+                }
+                self.eggs.retain(|e| e.cell != i);
+            }
+            if self.store[i] > 0 {
+                // Food left in a dying nest rots away before the room fills in.
+                self.store[i] -= 1;
+                self.dirty = true;
+                continue;
+            }
             self.cells[i] = Cell::Soil;
             self.widened[i] = false;
             self.dead_tip[i] = false;
@@ -1930,9 +1953,10 @@ impl World {
     fn hatch_eggs(&mut self) {
         let mut i = 0;
         while i < self.eggs.len() {
-            if self.eggs[i].hatch_at <= self.tick {
+            let dead_nest = self.nests.get(self.eggs[i].nest).is_none_or(|n| n.dead);
+            if self.eggs[i].hatch_at <= self.tick || dead_nest {
                 let e = self.eggs.swap_remove(i);
-                if self.cells[e.cell].dug() {
+                if !dead_nest && self.cells[e.cell].dug() {
                     let n = self.nest_of[e.cell];
                     let home = if n == NO_NEST { e.nest } else { n as usize };
                     if home < self.nests.len() && !self.nests[home].dead {
@@ -3470,6 +3494,24 @@ mod tests {
         }
         assert!(w.is_dug(ex + 1, y), "gap not filled:\n{}", w.snapshot());
         assert!(!w.is_dug(ex - 1, y), "started a fresh bump with no traffic");
+    }
+
+    #[test]
+    fn a_dead_nest_leaves_nothing_behind_not_even_food_or_trapped_ants() {
+        let mut w = World::new(Config { seed: 23, ants: Some(12), bud: false, drought: false, grow: false, ..Config::default() }, 90, 48);
+        fill_nest(&mut w, 0);
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        // Lose the queen with the larder full and the workers inside.
+        w.nests[0].queen = None;
+        w.nests[0].queen_lost = true;
+        w.eggs.push(Egg { cell: w.idx(w.entrances[0], w.ground[w.entrances[0]] + 2), nest: 0, hatch_at: u64::MAX });
+        let cells = w.nest_cells(0) as u64;
+        run(&mut w, DECAY_TICKS * (cells + 200));
+        assert!(w.cells.iter().all(|c| !c.dug()), "something still stands:\n{}", w.snapshot());
+        assert_eq!(w.stored(), 0);
+        assert!(w.eggs.is_empty());
+        assert!(w.ants.iter().all(|a| !a.underground), "an ant is buried alive in the soil");
     }
 
     #[test]
