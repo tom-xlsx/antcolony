@@ -83,10 +83,13 @@ room (where to put food), one from tunnel tips (where to dig next). Diggers keep
 wall around every tunnel so the farm stays readable, and stop once about a fifth of the soil
 is hollow. On the surface a one-dimensional trail of pheromone leads foragers to food.
 
-A nest is one connected tunnel system. Stored food above a threshold turns into a new worker
-every so often, and that is the only way the world gains ants. In a drought every worker eats
-a little from the nest's chambers each tick; a nest with nothing left loses a worker every
-half day until the drought ends or nobody is left. The status line shows `DRY SPELL`,
+A nest is one connected tunnel system. Workers eat a little from the chambers all year round
+and four times as much in a drought, so stores only build when foraging outpaces eating. A nest
+grows one worker at a time, and only once it holds a reserve for the workers it already has,
+so stockpiles come before mouths; that is the only way the world gains ants. In a drought a
+nest with nothing left loses a worker every half day until the drought ends or nobody is left.
+Tuned so that, on a 120×40 pane, restocking after a drought takes about a hundred days of the
+hundred and twenty between droughts, and roughly a third of droughts arrive before it is done. The status line shows `DRY SPELL`,
 `DROUGHT day 14/21` and `BLOOM`, and counts starving and dead nests. All the knobs (day
 length, drought spacing and length, consumption, starvation, spawn threshold) are constants
 at the top of `src/sim.rs`; `--headless 120000 --report` is the tuning loop.

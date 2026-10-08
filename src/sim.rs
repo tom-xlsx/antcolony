@@ -132,6 +132,11 @@ pub struct DroughtReport {
     pub nests_after: usize,
     pub ants_before: usize,
     pub ants_after: usize,
+    pub stored_before: u32,
+    pub stored_after: u32,
+    /// Days after the drought until stores were back to `stored_before`; `None` if the
+    /// next dry spell came first.
+    pub rebuilt_days: Option<u64>,
 }
 
 pub struct World {
@@ -159,7 +164,9 @@ pub struct World {
     pub delivered: u64,
     pub dug: usize,
     next_label: u8,
-    drought_before: (usize, usize),
+    drought_before: (usize, usize, u32),
+    /// (report index, store level to reach) while a rebuild is being timed.
+    rebuilding: Option<(usize, u32)>,
     exit_dist: Vec<u16>,
     store_dist: Vec<u16>,
     tip_dist: Vec<u16>,
@@ -186,8 +193,10 @@ const VISION: usize = 8;
 const STORE_CAP: u8 = 6;
 pub const NO_NEST: u16 = u16::MAX;
 
-// Growth: the only way the world gains ants.
+// Growth: the only way the world gains ants. A nest only grows once it holds a reserve
+// for the workers it already has, so stockpiles build before mouths do.
 const SPAWN_THRESHOLD: u32 = 12;
+const RESERVE_PER_WORKER: u32 = 8;
 const SPAWN_COST: u32 = 4;
 const SPAWN_INTERVAL: u64 = 60;
 
@@ -204,6 +213,9 @@ const BLOOM_LENGTH: u64 = 10 * DAY;
 const BLOOM_MULTIPLIER: u32 = 3;
 /// Food units each worker eats per tick while a drought is on.
 const CONSUME_RATE: f32 = 0.004;
+/// What a worker eats per tick the rest of the year, so stores only grow when foraging
+/// outpaces eating and a drought lands on whatever the colony actually managed to put by.
+const UPKEEP_RATE: f32 = 0.0008;
 const STARVE_INTERVAL: u32 = DAY as u32 / 2;
 const DEPOSIT: f32 = 0.08;
 const STRENGTH_DECAY: f32 = 0.985;
@@ -239,7 +251,8 @@ impl World {
             delivered: 0,
             dug: 0,
             next_label: 0,
-            drought_before: (0, 0),
+            drought_before: (0, 0, 0),
+            rebuilding: None,
             exit_dist: vec![FAR; w * h],
             store_dist: vec![FAR; w * h],
             tip_dist: vec![FAR; w * h],
@@ -346,6 +359,16 @@ impl World {
             .sum()
     }
 
+    /// Food units the nest's chambers can hold.
+    fn nest_capacity(&self, n: usize) -> u32 {
+        self.nest_of
+            .iter()
+            .zip(&self.cells)
+            .filter(|(&o, &c)| o as usize == n && c == Cell::Chamber)
+            .count() as u32
+            * STORE_CAP as u32
+    }
+
     fn nest_cells(&self, n: usize) -> usize {
         self.nest_of.iter().filter(|&&o| o as usize == n).count()
     }
@@ -411,7 +434,7 @@ impl World {
     }
 
     fn spawn_food(&mut self, size: f32) {
-        let units = ((self.rng.u32(30..=80) + self.ants.len() as u32 / 2) as f32 * size) as u32;
+        let units = (self.rng.u32(30..=80) as f32 * size) as u32;
         for _ in 0..40 {
             let x = 2 + self.rng.usize(..self.w - 4);
             let clear = self.entrances.iter().all(|&e| e.abs_diff(x) > 6)
@@ -466,6 +489,12 @@ impl World {
         }
         self.recount_workers();
         self.consume_and_starve();
+        if let Some((i, target)) = self.rebuilding {
+            if self.stored() >= target {
+                self.reports[i].rebuilt_days = Some((self.tick - self.reports[i].ended) / DAY);
+                self.rebuilding = None;
+            }
+        }
         if self.cfg.grow {
             self.maybe_grow();
         }
@@ -1119,7 +1148,11 @@ impl World {
             if nest.dead || self.tick - nest.last_spawn < SPAWN_INTERVAL {
                 continue;
             }
-            if nest.workers * 2 >= self.nest_cells(n) + 4 || self.nest_food(n) < SPAWN_THRESHOLD {
+            // A nest whose chambers can't hold its reserve still grows once they are nearly
+            // full; the extra mouths then push it to dig more chambers.
+            let capacity = self.nest_capacity(n);
+            let reserve = (SPAWN_THRESHOLD + nest.workers as u32 * RESERVE_PER_WORKER).min(capacity * 4 / 5);
+            if nest.workers * 2 >= self.nest_cells(n) + 4 || self.nest_food(n) < reserve {
                 continue;
             }
             if self.take_food(n, SPAWN_COST) {
@@ -1138,9 +1171,12 @@ impl World {
         }
         let t = self.tick;
         self.season = match self.season {
-            Season::Calm { until } if t >= until => Season::Warning { until: t + WARNING_LENGTH },
+            Season::Calm { until } if t >= until => {
+                self.rebuilding = None; // too late: whatever was put by is what they have
+                Season::Warning { until: t + WARNING_LENGTH }
+            }
             Season::Warning { until } if t >= until => {
-                self.drought_before = (self.live_nests(), self.ants.len());
+                self.drought_before = (self.live_nests(), self.ants.len(), self.stored());
                 let length = self.rng.u64(MIN_DURATION..=MAX_DURATION);
                 Season::Drought { until: t + length, started: t }
             }
@@ -1152,7 +1188,11 @@ impl World {
                     nests_after: self.live_nests(),
                     ants_before: self.drought_before.1,
                     ants_after: self.ants.len(),
+                    stored_before: self.drought_before.2,
+                    stored_after: self.stored(),
+                    rebuilt_days: None,
                 });
+                self.rebuilding = Some((self.reports.len() - 1, self.drought_before.2));
                 for nest in &mut self.nests {
                     nest.starving = false;
                     nest.starve_timer = 0;
@@ -1188,24 +1228,24 @@ impl World {
         }
     }
 
-    /// In a drought every nest eats from its stores, and a nest with nothing left loses a
-    /// worker every so often until food comes back or nobody is left.
+    /// Every nest eats from its stores all year, more in a drought. In a drought a nest with
+    /// nothing left loses a worker every so often until food comes back or nobody is left;
+    /// the rest of the year an empty larder just means no growth.
     fn consume_and_starve(&mut self) {
-        if !matches!(self.season, Season::Drought { .. }) {
-            return;
-        }
+        let drought = matches!(self.season, Season::Drought { .. });
+        let rate = if drought { CONSUME_RATE } else { UPKEEP_RATE };
         for n in 0..self.nests.len() {
             if self.nests[n].dead {
                 continue;
             }
-            self.nests[n].consume_acc += self.nests[n].workers as f32 * CONSUME_RATE;
+            self.nests[n].consume_acc += self.nests[n].workers as f32 * rate;
             while self.nests[n].consume_acc >= 1.0 {
                 self.nests[n].consume_acc -= 1.0;
                 if !self.take_food(n, 1) {
                     break;
                 }
             }
-            if self.nest_food(n) > 0 {
+            if !drought || self.nest_food(n) > 0 {
                 self.nests[n].starving = false;
                 self.nests[n].starve_timer = 0;
                 continue;
@@ -1372,7 +1412,8 @@ mod tests {
     fn ants_bring_food_home_and_the_colony_grows() {
         let mut w = world(2);
         let start = w.ants.len();
-        run(&mut w, 5000);
+        // Growth waits for a reserve now, so give the colony time to stock up first.
+        run(&mut w, 12000);
         assert!(w.delivered > 30, "only {} deliveries:\n{}", w.delivered, w.snapshot());
         assert!(w.ants.len() > start, "colony did not grow:\n{}", w.snapshot());
     }
@@ -1506,6 +1547,7 @@ mod tests {
         w.food.clear();
         w.tick = SPAWN_INTERVAL;
         fill_nest(&mut w, 1);
+        assert!(w.nest_food(1) >= SPAWN_THRESHOLD + w.nests[1].workers as u32 * RESERVE_PER_WORKER);
         let before = w.ants.len();
         w.maybe_grow();
         assert_eq!(w.ants.len(), before + 1);
@@ -1571,6 +1613,19 @@ mod tests {
         );
         // Either it broke in (one merged living nest) or it never touched it (two nests).
         assert!(w.nests.len() <= 2);
+    }
+
+    #[test]
+    fn upkeep_drains_stores_in_calm_weather_without_starving() {
+        let mut w = World::new(Config { seed: 3, ants: Some(40), drought: false, ..Config::default() }, 71, 48);
+        fill_nest(&mut w, 0);
+        let full = w.nest_food(0);
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        run(&mut w, 600);
+        assert!(w.nest_food(0) < full, "stores did not drain");
+        assert_eq!(w.ants.len(), 40, "nobody starves outside a drought");
+        assert!(!w.nests[0].starving && !w.nests[0].dead);
     }
 
     #[test]

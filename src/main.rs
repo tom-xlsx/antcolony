@@ -117,14 +117,20 @@ fn main() -> io::Result<()> {
         println!("{}", world.stats());
         if args.report {
             for r in &world.reports {
+                let rebuilt = match r.rebuilt_days {
+                    Some(d) => format!("rebuilt in {d} days"),
+                    None => "not rebuilt before the next dry spell".to_string(),
+                };
                 println!(
-                    "drought at day {} for {} days: nests {} -> {}, ants {} -> {}",
+                    "drought at day {} for {} days: nests {} -> {}, ants {} -> {}, stored {} -> {}, {rebuilt}",
                     r.started / sim::DAY,
                     (r.ended - r.started) / sim::DAY,
                     r.nests_before,
                     r.nests_after,
                     r.ants_before,
-                    r.ants_after
+                    r.ants_after,
+                    r.stored_before,
+                    r.stored_after,
                 );
             }
         }
