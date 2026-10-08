@@ -163,28 +163,51 @@ struct App {
 }
 
 impl App {
-    fn status(&self) -> Option<String> {
+    /// Status line, dropping the least important parts until it fits the pane.
+    fn status(&self, width: usize) -> Option<String> {
         if !self.show_status {
             return None;
         }
         let w = &self.world;
-        let mut s = format!(
-            "{} · ants {} · {} · eggs {} · stored {} · food {} · x{} ",
-            w.nest_summary(),
-            w.ants.len(),
-            w.job_summary(),
-            w.eggs.len(),
-            w.stored(),
-            w.food.len(),
-            self.speed
-        );
+        // Parts in order of importance (most important first).
+        let mut parts: Vec<(u8, String)> = vec![
+            (0, format!("x{}", self.speed)),
+            (1, w.nest_summary()),
+            (2, format!("ants {}", w.ants.len())),
+            (3, format!("food {}", w.food.len())),
+            (4, w.job_summary()),
+            (5, format!("stored {}", w.stored())),
+            (6, format!("eggs {}", w.eggs.len())),
+        ];
         if let Some(season) = w.season_label() {
-            s.insert_str(0, &format!("{season} · "));
+            parts.push((0, season));
         }
         if self.paused {
-            s.insert_str(0, "paused · ");
+            parts.push((0, "paused".into()));
         }
-        Some(s)
+        // Display order: paused, season, nests, ants, jobs, eggs, stored, food, speed.
+        let order = |p: &(u8, String)| match p.1.as_str() {
+            "paused" => 0,
+            _ if p.0 == 0 && p.1.starts_with('x') => 9,
+            _ if p.0 == 0 => 1,
+            _ => p.0 + 1,
+        };
+        loop {
+            let mut shown: Vec<&(u8, String)> = parts.iter().collect();
+            shown.sort_by_key(|p| order(p));
+            let line: String = shown.iter().map(|p| p.1.as_str()).collect::<Vec<_>>().join(" \u{b7} ") + " ";
+            if line.chars().count() <= width || parts.len() <= 3 {
+                return Some(line);
+            }
+            // Drop the least important optional part.
+            let drop = parts.iter().enumerate().filter(|(_, p)| p.0 > 0).max_by_key(|(_, p)| p.0).map(|(i, _)| i);
+            match drop {
+                Some(i) => {
+                    parts.remove(i);
+                }
+                None => return Some(line),
+            }
+        }
     }
 
     fn rebuild(&mut self, cols: u16, rows: u16) {
@@ -212,7 +235,7 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
                 }
             }
             terminal.draw(|frame| {
-                let status = app.status();
+                let status = app.status(frame.area().width as usize);
                 frame.render_widget(ui::Colony { world: &app.world, status }, frame.area());
             })?;
             next_frame = now + if app.speed == 1 { FRAME * 2 } else { FRAME };
