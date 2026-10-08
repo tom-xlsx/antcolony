@@ -46,4 +46,5 @@ pub const EGG: Rgb = (232, 228, 196);
 pub const CORPSE: Rgb = (96, 82, 74);
 pub const ROYAL: Rgb = (74, 52, 34);
 pub const ROYAL_PLAN: Rgb = (112, 84, 50);
+pub const ROYAL_OUTLINE: Rgb = (196, 158, 82);
 pub const ANT_STARVING: Rgb = (150, 50, 50);

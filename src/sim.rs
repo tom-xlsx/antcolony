@@ -171,6 +171,8 @@ pub struct Royal {
     pub cells: Vec<usize>,
     /// Cells already opened, where the queen will settle.
     pub dug: Vec<usize>,
+    /// Every cell of the planned hall, dug or not.
+    pub all: Vec<usize>,
 }
 
 /// How the nest's larder looks, measured in days it would last in a drought.
@@ -265,6 +267,11 @@ pub struct World {
     pub nest_of: Vec<u16>,
     /// How busy each tunnel cell has been lately; idle diggers widen the busiest.
     pub traffic: Vec<u16>,
+    /// The gold outline in the dirt around a queen's chamber: 0 none, 255 fresh. It stays
+    /// after she moves and fades once her line is dead.
+    pub royal_mark: Vec<u8>,
+    /// Label of the nest whose queen each outline belongs to.
+    royal_owner: Vec<u8>,
     pub season: Season,
     pub reports: Vec<DroughtReport>,
     pub tick: u64,
@@ -392,6 +399,9 @@ const RELOCATE_CHANCE: f32 = 0.002;
 const ROYAL_RX: usize = 4;
 const ROYAL_RY: usize = 2;
 const ROYAL_DIGGERS: usize = 3;
+/// Outline fade step every `OUTLINE_FADE_EVERY` ticks once the queen's line is dead.
+const OUTLINE_FADE_EVERY: u64 = 50;
+const OUTLINE_FADE_STEP: u8 = 4;
 
 // Seasons. A day is the unit the status line counts droughts in.
 pub const DAY: u64 = 100;
@@ -428,6 +438,8 @@ impl World {
             nests: Vec::new(),
             nest_of: vec![NO_NEST; n],
             traffic: vec![0; n],
+            royal_mark: vec![0; n],
+            royal_owner: vec![0; n],
             season: Season::Calm { until: GRACE_PERIOD },
             reports: Vec::new(),
             tick: 0,
@@ -501,11 +513,6 @@ impl World {
     fn dig_capped(&self, nest: usize) -> bool {
         let budget = self.soil_cells() * DIG_SHARE / 100 / self.live_nests().max(2);
         self.nest_cells(nest) > budget
-    }
-
-    fn is_husk(&self, x: usize, y: usize) -> bool {
-        let n = self.nest_of[self.idx(x, y)];
-        n != NO_NEST && self.nests[n as usize].dead
     }
 
     fn in_drought(&self) -> bool {
@@ -927,6 +934,9 @@ impl World {
         self.recount_workers();
         self.update_bands();
         self.hunger();
+        if self.tick.is_multiple_of(OUTLINE_FADE_EVERY) {
+            self.fade_outlines();
+        }
         self.tend_queens();
         self.hatch_eggs();
         self.allocate_jobs();
@@ -1628,7 +1638,7 @@ impl World {
     /// corridor up to `MAX_WIDTH` across. Only corridors (two opposite dug neighbours whose
     /// other two sides are soil or earlier widening), never near the surface or another tunnel.
     fn widen_spot(&mut self, here: usize) -> Option<usize> {
-        if self.cells[here] != Cell::Tunnel || self.traffic[here] < WIDEN_TRAFFIC || self.widened[here] {
+        if self.cells[here] != Cell::Tunnel || self.widened[here] {
             return None;
         }
         let (x, y) = (here % self.w, here / self.w);
@@ -1652,8 +1662,37 @@ impl World {
         if already + 1 >= MAX_WIDTH {
             return None;
         }
-        let first = self.rng.bool();
-        for &(dx, dy) in [sides[first as usize], sides[!first as usize]].iter() {
+        // Along-corridor neighbours, to judge whether a side continues existing widening.
+        let along: [(i32, i32); 2] = if horizontal { [(1, 0), (-1, 0)] } else { [(0, 1), (0, -1)] };
+        let widened_at = |w: &Self, dx: i32, dy: i32| {
+            let (ax, ay) = (x as i32 + dx, y as i32 + dy);
+            ax >= 0 && ay >= 0 && (ax as usize) < w.w && (ay as usize) < w.h && w.widened[w.idx(ax as usize, ay as usize)]
+        };
+        // Smoothing: a gap between two widened cells is filled first, whatever the traffic;
+        // extending an existing widened stretch comes next and needs less traffic than
+        // starting a fresh one, so widening grows in runs instead of scattered bumps.
+        let mut ranked: Vec<((i32, i32), u8)> = sides
+            .iter()
+            .map(|&(dx, dy)| {
+                let before = widened_at(self, dx + along[0].0, dy + along[0].1);
+                let after = widened_at(self, dx + along[1].0, dy + along[1].1);
+                let rank = if before && after { 0 } else if before || after { 1 } else { 2 };
+                ((dx, dy), rank)
+            })
+            .collect();
+        ranked.sort_by_key(|&(_, r)| r);
+        if self.rng.bool() && ranked[0].1 == ranked[1].1 {
+            ranked.swap(0, 1);
+        }
+        for ((dx, dy), rank) in ranked {
+            let needed = match rank {
+                0 => 0,
+                1 => WIDEN_TRAFFIC / 2,
+                _ => WIDEN_TRAFFIC,
+            };
+            if self.traffic[here] < needed {
+                continue;
+            }
             let (cx, cy) = ((x as i32 + dx) as usize, (y as i32 + dy) as usize);
             let c = self.idx(cx, cy);
             if self.cells[c] != Cell::Soil || self.planned_royal(c) {
@@ -1747,6 +1786,68 @@ impl World {
         }
     }
 
+    /// Make the room around (x, y) the queen's chamber: its cells become royal and the
+    /// soil around it gets the outline, owned by nest `n`'s line.
+    fn crown(&mut self, n: usize, x: usize, y: usize) {
+        let start = self.idx(x, y);
+        if !self.cells[start].room() {
+            return;
+        }
+        let label = self.nests[n].label as u8;
+        let mut hall = vec![start];
+        let mut q = VecDeque::from([start]);
+        let mut seen = vec![false; self.cells.len()];
+        seen[start] = true;
+        while let Some(i) = q.pop_front() {
+            let (cx, cy) = (i % self.w, i / self.w);
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
+                    continue;
+                }
+                let j = self.idx(nx as usize, ny as usize);
+                if !seen[j] && self.cells[j].room() {
+                    seen[j] = true;
+                    hall.push(j);
+                    q.push_back(j);
+                }
+            }
+        }
+        for &i in &hall {
+            self.cells[i] = Cell::Royal;
+            let (cx, cy) = (i % self.w, i / self.w);
+            for dy in -1..=1_i32 {
+                for dx in -1..=1_i32 {
+                    let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
+                        continue;
+                    }
+                    let j = self.idx(nx as usize, ny as usize);
+                    if self.cells[j] == Cell::Soil {
+                        self.royal_mark[j] = 255;
+                        self.royal_owner[j] = label;
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Outlines whose line has died fade away.
+    fn fade_outlines(&mut self) {
+        let mut alive = [false; 256];
+        for nest in &self.nests {
+            if !nest.dead && nest.queen.is_some() {
+                alive[nest.label as u8 as usize] = true;
+            }
+        }
+        for i in 0..self.royal_mark.len() {
+            if self.royal_mark[i] > 0 && (!alive[self.royal_owner[i] as usize] || self.cells[i] != Cell::Soil) {
+                self.royal_mark[i] = self.royal_mark[i].saturating_sub(OUTLINE_FADE_STEP);
+            }
+        }
+    }
+
     /// A nest that has never had a queen gets one in its first room; a queen with a full
     /// belly lays an egg every so often.
     fn tend_queens(&mut self) {
@@ -1768,6 +1869,7 @@ impl World {
                         last_relocation: self.tick,
                         cooldown: 0,
                     });
+                    self.crown(n, i % self.w, i / self.w);
                     self.queens_moved = true;
                 }
             }
@@ -1868,20 +1970,28 @@ impl World {
         }
     }
 
-    /// Choose a spot deeper than `min_y` with enough undug earth around a tunnel for a
-    /// royal chamber, and mark its cells as the plan.
+    /// Find a suitable deeper chamber: an existing room below `min_y` by preference (the
+    /// diggers then enlarge it into a hall), else a stretch of tunnel to carve one around.
     fn plan_royal(&mut self, n: usize, min_y: usize) {
-        let anchors: Vec<usize> = (0..self.cells.len())
+        let mut rooms: Vec<usize> = (0..self.cells.len())
+            .filter(|&i| self.nest_of[i] as usize == n && self.cells[i] == Cell::Chamber && i / self.w >= min_y)
+            .collect();
+        rooms.sort_by_key(|&i| std::cmp::Reverse(i / self.w)); // deepest first
+        let tunnels: Vec<usize> = (0..self.cells.len())
             .filter(|&i| self.nest_of[i] as usize == n && self.cells[i] == Cell::Tunnel && i / self.w >= min_y)
             .collect();
-        if anchors.is_empty() {
-            return;
+        let mut tries: Vec<usize> = rooms.iter().copied().take(12).collect();
+        for _ in 0..20 {
+            if tunnels.is_empty() {
+                break;
+            }
+            tries.push(tunnels[self.rng.usize(..tunnels.len())]);
         }
-        for _ in 0..30 {
-            let a = anchors[self.rng.usize(..anchors.len())];
+        for a in tries {
             let (cx, cy) = (a % self.w, a / self.w);
-            if let Some(cells) = self.royal_blob(cx, cy) {
-                self.nests[n].royal = Some(Royal { cells, dug: vec![a] });
+            if let Some((cells, all)) = self.royal_blob(cx, cy) {
+                let dug: Vec<usize> = all.iter().copied().filter(|&i| self.cells[i].dug()).collect();
+                self.nests[n].royal = Some(Royal { cells, dug, all });
                 self.dirty = true;
                 return;
             }
@@ -1891,9 +2001,10 @@ impl World {
     /// Soil cells of an ellipse around (cx, cy) to dig for a royal chamber. The nest's own
     /// tunnels inside the ellipse simply become part of the hall; another nest's anywhere
     /// near it rule the spot out.
-    fn royal_blob(&self, cx: usize, cy: usize) -> Option<Vec<usize>> {
+    fn royal_blob(&self, cx: usize, cy: usize) -> Option<(Vec<usize>, Vec<usize>)> {
         let own_nest = self.nest_of[self.idx(cx, cy)];
         let mut cells = Vec::new();
+        let mut all = Vec::new();
         for dy in -(ROYAL_RY as i32)..=(ROYAL_RY as i32) {
             for dx in -(ROYAL_RX as i32)..=(ROYAL_RX as i32) {
                 let (x, y) = (cx as i32 + dx, cy as i32 + dy);
@@ -1910,13 +2021,17 @@ impl World {
                 }
                 let i = self.idx(x, y);
                 match self.cell(x, y) {
-                    Cell::Soil => cells.push(i),
+                    Cell::Soil => {
+                        cells.push(i);
+                        all.push(i);
+                    }
                     Cell::Sky => return None,
-                    _ if self.nest_of[i] == own_nest => {}
+                    _ if self.nest_of[i] == own_nest => all.push(i),
                     _ => return None,
                 }
             }
         }
+        all.push(self.idx(cx, cy));
         for &c in &cells {
             let (x, y) = (c % self.w, c / self.w);
             for dy in -1..=1_i32 {
@@ -1929,7 +2044,7 @@ impl World {
                 }
             }
         }
-        (cells.len() >= 8).then_some(cells)
+        (cells.len() >= 8).then_some((cells, all))
     }
 
     fn walk_queen(&mut self, n: usize) {
@@ -1947,7 +2062,15 @@ impl World {
             q.relocations += 1;
             q.last_relocation = self.tick;
             q.settle_until = self.tick + SETTLE_TIME;
-            self.nests[n].royal = None;
+            // The hall is hers now: every opened cell of the plan becomes royal.
+            if let Some(r) = self.nests[n].royal.take() {
+                for i in r.all {
+                    if self.cells[i].dug() {
+                        self.cells[i] = Cell::Royal;
+                    }
+                }
+            }
+            self.crown(n, qx, qy);
             self.queens_moved = true;
             self.dirty = true;
             return;
@@ -2014,8 +2137,8 @@ impl World {
                 if self.cell(ax, ay).room() && ax.abs_diff(fx) <= 3 && ay.abs_diff(fy) <= 3 {
                     continue; // our own room, when digging out of it
                 }
-                if self.is_dug(ax, ay) && !self.is_husk(ax, ay) {
-                    return false; // breaking into a husk is fine: that is how it gets reused
+                if self.is_dug(ax, ay) {
+                    return false; // husks included: they crumble away in their own time
                 }
                 if self.planned_royal(self.idx(ax, ay)) {
                     return false; // leave the royal chamber's earth alone
@@ -2300,6 +2423,14 @@ impl World {
         for i in 0..n {
             self.nest_of[i] = if comp[i] == NO_NEST { NO_NEST } else { comp_nest[comp[i] as usize] };
         }
+        // Ants and eggs always need a nest to point at. If every nest has crumbled away,
+        // keep one dead placeholder until a founding queen starts things again.
+        if nests.is_empty() && !(self.ants.is_empty() && self.eggs.is_empty()) {
+            let mut husk = Nest::new('-', Vec::new());
+            husk.dead = true;
+            husk.queen_lost = true;
+            nests.push(husk);
+        }
         self.nests = nests;
 
         // Ants underground belong to the system they stand in; ants on the surface keep
@@ -2547,6 +2678,7 @@ impl World {
                     };
                     match self.cell(x, y) {
                         Cell::Sky => ' ',
+                        Cell::Soil if self.royal_mark[i] > 0 => '=',
                         Cell::Soil => '#',
                         _ if husk => 'x',
                         Cell::Tunnel => '.',
@@ -2574,7 +2706,7 @@ impl World {
             notes.push(format!("{} queenless", self.queenless_nests()));
         }
         if self.royal_digs() > 0 {
-            notes.push(format!("{} digging royal", self.royal_digs()));
+            notes.push(format!("{} preparing a hall", self.royal_digs()));
         }
         if self.moving_queens() > 0 {
             notes.push(format!("{} moving", self.moving_queens()));
@@ -3195,6 +3327,80 @@ mod tests {
             }
         }
         assert!(w.nest_cells(n) > cells + 10, "sealed nest never dug out: {} -> {}\n{}", cells, w.nest_cells(n), w.snapshot());
+    }
+
+    #[test]
+    fn the_queens_chamber_is_outlined_and_the_outline_fades_with_her_line() {
+        let mut w = World::new(Config { seed: 21, ants: Some(10), bud: false, drought: false, ..Config::default() }, 90, 48);
+        let (qx, qy) = {
+            let q = w.nests[0].queen.as_ref().unwrap();
+            (q.x, q.y)
+        };
+        assert_eq!(w.cell(qx, qy), Cell::Royal, "her first room should be royal");
+        let marked = w.royal_mark.iter().filter(|&&m| m > 0).count();
+        assert!(marked >= 8, "no outline around the chamber:\n{}", w.snapshot());
+        w.nests[0].queen = None;
+        w.nests[0].queen_lost = true;
+        run(&mut w, OUTLINE_FADE_EVERY * (255 / OUTLINE_FADE_STEP as u64 + 2));
+        assert_eq!(w.royal_mark.iter().filter(|&&m| m > 0).count(), 0, "outline should have faded");
+    }
+
+    #[test]
+    fn diggers_leave_husks_alone() {
+        let mut w = World::new(Config { seed: 6, ants: Some(4), bud: false, drought: false, ..Config::default() }, 90, 48);
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        w.season = Season::Drought { until: w.tick + 500 * DAY, started: w.tick };
+        run(&mut w, 4000);
+        assert!(w.ants.is_empty() && w.nests.iter().all(|n| n.dead), "{}", w.stats());
+        w.season = Season::Calm { until: u64::MAX };
+        let x = 60; // beside the husk (the starter nest sits at column 45)
+        dig_system(&mut w, x, 4);
+        let n = w.nests.iter().position(|nst| nst.entrances.contains(&x)).unwrap();
+        let label = w.nests[n].label;
+        for _ in 0..12 {
+            w.spawn_ant(n, None);
+        }
+        w.recount_workers();
+        for _ in 0..60 {
+            run(&mut w, 100);
+            // Nest A's tunnels only ever crumble; nobody tunnels in and brings it back.
+            assert!(!w.nests.iter().any(|nst| nst.label == 'A' && !nst.dead), "husk A came back to life");
+            assert!(w.nests.iter().filter(|nst| !nst.dead).all(|nst| nst.label == label));
+        }
+    }
+
+    #[test]
+    fn widening_fills_gaps_before_starting_new_bumps() {
+        let mut w = World::new(Config { seed: 22, ants: Some(1), bud: false, drought: false, ..Config::default() }, 71, 48);
+        let ex = w.entrances[0];
+        let g = w.ground[ex];
+        for y in g..(g + 24) {
+            w.set(ex, y, Cell::Tunnel);
+        }
+        for y in [g + 15, g + 17] {
+            let c = w.idx(ex + 1, y);
+            w.cells[c] = Cell::Tunnel;
+            w.widened[c] = true;
+        }
+        w.refresh_fields();
+        let y = g + 16;
+        let here = w.idx(ex, y);
+        w.ants[0] = ant_at(ex, y, Job::Digger, State::Idle, true);
+        for _ in 0..400 {
+            w.tick();
+            w.ants[0].x = ex;
+            w.ants[0].y = y;
+            w.ants[0].job = Job::Digger;
+            w.ants[0].state = State::Idle;
+            w.ants[0].idle = 5000;
+            w.traffic[here] = 0; // no traffic at all: only the gap rule may act
+            if w.is_dug(ex + 1, y) {
+                break;
+            }
+        }
+        assert!(w.is_dug(ex + 1, y), "gap not filled:\n{}", w.snapshot());
+        assert!(!w.is_dug(ex - 1, y), "started a fresh bump with no traffic");
     }
 
     #[test]

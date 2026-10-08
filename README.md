@@ -43,7 +43,8 @@ hundred ticks later. That is the only way the world gains ants. If she
 dies the nest is doomed: no more eggs, and once the rooms are eaten bare the workers walk off
 to join the nearest nest that still has a queen. Her corpse lies in the chamber for a while.
 A queenless nest crumbles slowly back into soil from its tips inward, entrance last, so the
-ground is free for whoever comes next. If the whole farm goes queenless for fifty days, a
+ground is free for whoever comes next; living nests leave the husk alone rather than tunnel
+into it. If the whole farm goes queenless for fifty days, a
 founding queen flies in from outside, digs a short shaft and lays from her own reserve until
 she has a few workers.
 
@@ -78,10 +79,12 @@ a room. Corpses lie where they fell and fade. The queen carries a much larger re
 bad drought the workers go before she does; if it goes on long enough she stops laying, then
 starves too.
 
-Once a nest is deep and its larder plentiful, a few diggers open a royal chamber near the
-bottom, about twice the size of a room and in a warmer shade while it is being dug. When it
-is open the queen walks down to it, slowly, nurses trailing, and settles there. She moves at
-most twice, and the nest keeps digging below her.
+The queen's chamber is outlined in gold in the surrounding dirt. Once a nest is deep and its
+larder plentiful, it looks for a suitable deeper room and a few diggers prepare it, enlarging
+it into a hall about twice the size of a room (a warmer shade marks the earth still to dig).
+When it is ready the queen walks down to it, slowly, nurses trailing, and settles there. The
+old chamber keeps its outline; she moves at most twice, and the nest keeps digging below her.
+When her line dies the outlines fade away with the nest.
 
 The status line shows the jobs as `f66 n12 d30 s12`, the egg count, and nest flags such as
 `1 queenless`, `1 digging royal`, `1 moving`.
@@ -138,7 +141,8 @@ is hollow. On the surface a one-dimensional trail of pheromone leads foragers to
 
 A nest is one connected tunnel system. Each living nest may hollow out a share of the soil
 (two-fifths of it between them; a lone nest gets a fifth), so diggers work until that is used
-and then idle in the tunnels, widening the busiest corridors to three cells as they loiter. Food goes into rooms; every ant eats from it; the queen turns a
+and then idle in the tunnels, widening the busiest corridors to three cells as they loiter,
+filling gaps and extending runs before starting new ones so the wide stretches stay smooth. Food goes into rooms; every ant eats from it; the queen turns a
 full belly into eggs. Tuned so that on a 120×40 pane most droughts kill a nest or two and
 none wipe the farm, and restocking takes a good part of the gap between droughts.
 

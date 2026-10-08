@@ -90,10 +90,18 @@ pub fn paint(world: &World) -> Vec<Rgb> {
                 Cell::Soil => {
                     let depth = y.saturating_sub(ground) as i16;
                     let var = (n % 17) as i16 - 8;
-                    if n % 100 < 4 {
+                    let soil = if n % 100 < 4 {
                         palette::shade(wx.pebble, var - depth.min(30) / 2)
                     } else {
                         palette::shade(wx.soil, var - depth.min(30))
+                    };
+                    let mark = world.royal_mark[y * w + x];
+                    if mark > 0 {
+                        // Quantised so the fade doesn't repaint the ring every frame.
+                        let t = ((mark as f32 / 255.0) * 8.0).ceil() / 8.0;
+                        palette::lerp(soil, palette::ROYAL_OUTLINE, 0.85 * t)
+                    } else {
+                        soil
                     }
                 }
                 Cell::Tunnel | Cell::Chamber | Cell::Royal => {
