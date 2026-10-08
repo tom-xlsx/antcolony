@@ -8,6 +8,12 @@ for the others and carry it down into the chambers, which slowly fill with green
 feeds new ants, more ants dig more tunnels, and once the colony is big enough a small party
 walks off along the surface and opens a second nest.
 
+Then the seasons turn. Every so often a dry spell sets in, the sky goes dusty, a sun comes out
+and the surface food stops. Each nest lives off what it stored: well-stocked nests ride it out,
+small or careless ones starve, lose workers and die, leaving their tunnels as a grey husk for
+the next colony to break into. When the rain comes back there is a bloom, survivors regrow,
+and the question is whether they stock enough before the next one.
+
 Nothing to configure. Drop it in a zellij or tmux pane and leave it running.
 
 ```
@@ -61,6 +67,8 @@ Resizing the pane starts a fresh colony at the new size.
 --max-nests N   most nest entrances allowed (default 4)
 --no-bud        a big colony never sends out a party to open a new nest
 --no-grow       fixed population; stored food never becomes new ants
+--no-drought    endless calm: no dry spells, droughts or blooms
+--report        with --headless, print one line per drought (for tuning)
 --quiet, -q     start with the status line hidden
 --headless T    run T ticks with no terminal and print a text snapshot
 --size CxR      world size for --headless, in terminal cells (default 71x24)
@@ -74,6 +82,17 @@ breadth-first distance fields: one from the entrances (the way out), one from ch
 room (where to put food), one from tunnel tips (where to dig next). Diggers keep a two-cell
 wall around every tunnel so the farm stays readable, and stop once about a fifth of the soil
 is hollow. On the surface a one-dimensional trail of pheromone leads foragers to food.
+
+A nest is one connected tunnel system. Stored food above a threshold turns into a new worker
+every so often, and that is the only way the world gains ants. In a drought every worker eats
+a little from the nest's chambers each tick; a nest with nothing left loses a worker every
+half day until the drought ends or nobody is left. The status line shows `DRY SPELL`,
+`DROUGHT day 14/21` and `BLOOM`, and counts starving and dead nests. All the knobs (day
+length, drought spacing and length, consumption, starvation, spawn threshold) are constants
+at the top of `src/sim.rs`; `--headless 120000 --report` is the tuning loop.
+
+Future hooks, deliberately not built: a queen replacing the growth rule, brood and castes,
+raiding between nests, dormancy during droughts.
 
 `src/sim.rs` is the simulation and has no terminal code in it. `src/ui.rs` paints a world into a
 ratatui buffer. `src/main.rs` is the event loop and flags.

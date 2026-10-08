@@ -10,7 +10,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
 use crate::palette::{self, Rgb};
-use crate::sim::{Cell, State, World};
+use crate::sim::{Cell, Season, State, World, NO_NEST};
 
 pub struct Colony<'a> {
     pub world: &'a World,
@@ -28,10 +28,41 @@ fn hash(x: usize, y: usize) -> u32 {
 
 const STORE_CAP: f32 = 6.0;
 
+/// How the season tints the world: fixed per phase so unchanged cells stay unchanged.
+struct Weather {
+    sky: Rgb,
+    soil: Rgb,
+    pebble: Rgb,
+    grass: Rgb,
+    /// Grass tufts per hundred surface cells.
+    tufts: u32,
+    sun: bool,
+}
+
+fn weather(season: Season) -> Weather {
+    let dust = |t: f32| Weather {
+        sky: palette::lerp(palette::SKY, palette::DUST_SKY, t),
+        soil: palette::lerp(palette::SOIL, palette::DUST_SOIL, t),
+        pebble: palette::lerp(palette::PEBBLE, palette::DUST_SOIL, t * 0.5),
+        grass: palette::lerp(palette::GRASS, palette::STRAW, t),
+        tufts: 12,
+        sun: false,
+    };
+    match season {
+        Season::Drought { .. } => Weather { sun: true, ..dust(0.55) },
+        Season::Warning { .. } => dust(0.25),
+        Season::Bloom { .. } => Weather { grass: palette::BLOOM_GRASS, tufts: 20, ..dust(0.0) },
+        Season::Calm { .. } | Season::Cooldown { .. } => dust(0.0),
+    }
+}
+
 /// Flat RGB pixel buffer the size of the world.
 pub fn paint(world: &World) -> Vec<Rgb> {
     let (w, h) = (world.w, world.h);
-    let mut px = vec![palette::SKY; w * h];
+    let wx = weather(world.season);
+    let mut px = vec![wx.sky; w * h];
+    // Sun sits top-right of the sky during a drought.
+    let sun = (w as i32 - 6, 3_i32);
 
     for y in 0..h {
         for x in 0..w {
@@ -41,32 +72,47 @@ pub fn paint(world: &World) -> Vec<Rgb> {
                 Cell::Sky => {
                     if y + 1 == ground {
                         // Surface strip: grass tufts and the foraging trail.
-                        let base = if n % 100 < 12 { palette::GRASS } else { palette::SKY };
+                        let base = if n % 100 < wx.tufts { wx.grass } else { wx.sky };
                         let t = (world.surf_ph[x].min(1.0) * 6.0).round() / 6.0;
                         if t > 0.0 {
                             palette::lerp(base, palette::TRAIL, 0.15 + 0.6 * t)
                         } else {
                             base
                         }
+                    } else if wx.sun && (x as i32 - sun.0).pow(2) + (y as i32 - sun.1).pow(2) <= 5 {
+                        palette::SUN
                     } else if n % 1000 < 5 {
                         palette::STAR
                     } else {
-                        palette::SKY
+                        wx.sky
                     }
                 }
                 Cell::Soil => {
                     let depth = y.saturating_sub(ground) as i16;
                     let var = (n % 17) as i16 - 8;
                     if n % 100 < 4 {
-                        palette::shade(palette::PEBBLE, var - depth.min(30) / 2)
+                        palette::shade(wx.pebble, var - depth.min(30) / 2)
                     } else {
-                        palette::shade(palette::SOIL, var - depth.min(30))
+                        palette::shade(wx.soil, var - depth.min(30))
                     }
                 }
-                Cell::Tunnel => palette::TUNNEL,
-                Cell::Chamber => {
-                    let s = world.store[y * w + x] as f32;
-                    palette::lerp(palette::CHAMBER, palette::FOOD, s / STORE_CAP)
+                Cell::Tunnel | Cell::Chamber => {
+                    let i = y * w + x;
+                    let base = if world.cell(x, y) == Cell::Tunnel {
+                        palette::TUNNEL
+                    } else {
+                        palette::lerp(palette::CHAMBER, palette::FOOD, world.store[i] as f32 / STORE_CAP)
+                    };
+                    let nest = world.nest_of[i];
+                    if nest == NO_NEST {
+                        base
+                    } else if world.nests[nest as usize].dead {
+                        palette::ABANDONED
+                    } else if world.nests[nest as usize].starving {
+                        palette::lerp(base, (0, 0, 0), 0.35)
+                    } else {
+                        base
+                    }
                 }
             };
             px[y * w + x] = c;

@@ -16,6 +16,13 @@ pub const ANT_CARRYING: Rgb = (190, 240, 150);
 pub const ANT_DIGGING: Rgb = (224, 188, 132);
 pub const ANT_FOUNDING: Rgb = (255, 196, 110);
 pub const STATUS: Rgb = (150, 140, 124);
+// Seasons.
+pub const DUST_SKY: Rgb = (46, 34, 26);
+pub const DUST_SOIL: Rgb = (132, 108, 72);
+pub const STRAW: Rgb = (152, 132, 60);
+pub const BLOOM_GRASS: Rgb = (72, 164, 60);
+pub const SUN: Rgb = (242, 204, 86);
+pub const ABANDONED: Rgb = (60, 52, 46);
 pub const STATUS_BG: Rgb = (24, 18, 12);
 
 pub fn lerp(a: Rgb, b: Rgb, t: f32) -> Rgb {

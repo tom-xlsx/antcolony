@@ -48,6 +48,12 @@ struct Args {
     /// Most nest entrances allowed at once.
     #[arg(long, default_value_t = 4)]
     max_nests: usize,
+    /// No droughts: endless calm.
+    #[arg(long)]
+    no_drought: bool,
+    /// With --headless: print one line per drought (for tuning).
+    #[arg(long)]
+    report: bool,
     /// Hide the status line.
     #[arg(long, short)]
     quiet: bool,
@@ -97,6 +103,7 @@ fn main() -> io::Result<()> {
         grow: !args.no_grow,
         bud: !args.no_bud && !args.no_grow,
         max_nests: args.max_nests.max(1),
+        drought: !args.no_drought,
         seed: args.seed.unwrap_or_else(|| fastrand::u64(..)),
         ..Config::default()
     };
@@ -108,6 +115,19 @@ fn main() -> io::Result<()> {
         }
         print!("{}", world.snapshot());
         println!("{}", world.stats());
+        if args.report {
+            for r in &world.reports {
+                println!(
+                    "drought at day {} for {} days: nests {} -> {}, ants {} -> {}",
+                    r.started / sim::DAY,
+                    (r.ended - r.started) / sim::DAY,
+                    r.nests_before,
+                    r.nests_after,
+                    r.ants_before,
+                    r.ants_after
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -140,14 +160,17 @@ impl App {
         }
         let w = &self.world;
         let mut s = format!(
-            "nests {} · ants {} · dug {} · stored {} · food {} · x{} ",
-            w.entrances.len(),
+            "{} · ants {} · dug {} · stored {} · food {} · x{} ",
+            w.nest_summary(),
             w.ants.len(),
             w.dug,
             w.stored(),
             w.food.len(),
             self.speed
         );
+        if let Some(season) = w.season_label() {
+            s.insert_str(0, &format!("{season} · "));
+        }
         if self.paused {
             s.insert_str(0, "paused · ");
         }
