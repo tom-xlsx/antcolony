@@ -10,7 +10,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
 use crate::palette::{self, Rgb};
-use crate::sim::{Cell, Season, State, World, NO_NEST};
+use crate::sim::{Cell, Role, Season, State, World, NO_NEST};
 
 pub struct Colony<'a> {
     pub world: &'a World,
@@ -143,11 +143,13 @@ pub fn paint(world: &World) -> Vec<Rgb> {
 
     for ant in &world.ants {
         if ant.x < w && ant.y < h {
-            px[ant.y * w + ant.x] = match ant.state {
-                State::Returning => palette::ANT_CARRYING,
-                State::Digging => palette::ANT_DIGGING,
-                State::Founding(_) => palette::ANT_FOUNDING,
-                State::Foraging | State::ToTip => palette::ANT,
+            px[ant.y * w + ant.x] = match (ant.state, ant.role) {
+                (State::Returning, _) => palette::ANT_CARRYING,
+                (State::Founding(_), _) => palette::ANT_FOUNDING,
+                (_, Role::Forager) => palette::ANT,
+                (_, Role::Digger) => palette::ANT_DIGGING,
+                (_, Role::Scout) => palette::ANT_SCOUT,
+                (_, Role::Nurse) => palette::ANT_NURSE,
             };
         }
     }

@@ -166,10 +166,10 @@ impl App {
         }
         let w = &self.world;
         let mut s = format!(
-            "{} · ants {} · dug {} · stored {} · food {} · x{} ",
+            "{} · ants {} · {} · stored {} · food {} · x{} ",
             w.nest_summary(),
             w.ants.len(),
-            w.dug,
+            w.caste_summary(),
             w.stored(),
             w.food.len(),
             self.speed

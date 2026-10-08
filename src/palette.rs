@@ -15,6 +15,8 @@ pub const ANT: Rgb = (236, 232, 220);
 pub const ANT_CARRYING: Rgb = (190, 240, 150);
 pub const ANT_DIGGING: Rgb = (224, 188, 132);
 pub const ANT_FOUNDING: Rgb = (255, 196, 110);
+pub const ANT_SCOUT: Rgb = (150, 200, 255);
+pub const ANT_NURSE: Rgb = (240, 170, 205);
 pub const STATUS: Rgb = (150, 140, 124);
 // Seasons.
 pub const DUST_SKY: Rgb = (46, 34, 26);

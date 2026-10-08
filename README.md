@@ -30,8 +30,21 @@ Nothing to configure. Drop it in a zellij or tmux pane and leave it running.
 #######.###ooooooo###.#####%%%%%%%#############.##############
 ```
 
-(Text snapshot from `--headless`: `.` tunnel, `o` chamber, `%` stored food, `a` ant. The real
-thing is in colour.)
+(Text snapshot from `--headless`: `.` tunnel, `o` chamber, `%` stored food, `f d s n` ants by
+caste. The real thing is in colour.)
+
+## Castes
+
+Every ant is born into a trade, and a nest keeps its castes near a fixed mix.
+
+| Caste | Share | Colour | Does |
+|---|---|---|---|
+| Forager | 60% | ivory | works the surface near home, follows trails, hauls food (green while carrying) |
+| Digger | 20% | tan | lives underground extending tunnels and carving chambers |
+| Scout | 10% | pale blue | ranges the whole surface, sees further, lays the strong trail that brings foragers, leads founding parties (orange on the march) |
+| Nurse | 10% | pink | keeps to the chambers minding the stores |
+
+The status line shows the counts as `f66 d30 s12 n12`.
 
 ## Install
 
@@ -83,7 +96,9 @@ room (where to put food), one from tunnel tips (where to dig next). Diggers keep
 wall around every tunnel so the farm stays readable, and stop once about a fifth of the soil
 is hollow. On the surface a one-dimensional trail of pheromone leads foragers to food.
 
-A nest is one connected tunnel system. Workers eat a little from the chambers all year round
+A nest is one connected tunnel system. Each living nest may hollow out a share of the soil
+(two-fifths of it between them; a lone nest gets a fifth), so diggers work until that is used
+and then idle in the tunnels. Workers eat a little from the chambers all year round
 and four times as much in a drought, so stores only build when foraging outpaces eating. A nest
 grows one worker at a time, and only once it holds a reserve for the workers it already has,
 so stockpiles come before mouths; that is the only way the world gains ants. In a drought a

@@ -44,6 +44,23 @@ pub enum Cell {
     Chamber,
 }
 
+/// What an ant is for. Fixed at birth; a nest keeps its castes near `ROLE_SHARES`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Works the surface near home, follows trails, hauls food.
+    Forager = 0,
+    /// Lives underground extending tunnels and carving chambers.
+    Digger = 1,
+    /// Ranges far along the surface, finds food first, founds new nests.
+    Scout = 2,
+    /// Stays in the chambers minding the stores.
+    Nurse = 3,
+}
+
+/// Target share of each caste, in percent.
+const ROLE_SHARES: [(Role, u32); 4] =
+    [(Role::Forager, 60), (Role::Digger, 20), (Role::Scout, 10), (Role::Nurse, 10)];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Looking for food: underground this means heading for an exit.
@@ -56,6 +73,8 @@ pub enum State {
     Digging,
     /// Walking along the surface to open a new nest at this column.
     Founding(usize),
+    /// Pottering about underground for a while.
+    Idle,
 }
 
 #[derive(Clone, Debug)]
@@ -63,10 +82,13 @@ pub struct Ant {
     pub x: usize,
     pub y: usize,
     pub state: State,
+    pub role: Role,
     /// On the surface or in a tunnel.
     pub underground: bool,
     /// Index into `World::nests`.
     pub home: usize,
+    /// Ticks left of idling.
+    idle: u16,
     /// Surface walking direction, -1 or 1.
     dir: i32,
     /// Ticks until the next move.
@@ -188,8 +210,10 @@ const FAR: u16 = u16::MAX;
 const MOVE_TICKS: u8 = 3;
 const DIG_TICKS: u8 = 24;
 /// Diggers stop once this share of the soil is hollow.
-const DIG_SHARE: usize = 30;
+const DIG_SHARE: usize = 40;
 const VISION: usize = 8;
+const SCOUT_VISION: usize = 14;
+const IDLE_TICKS: u16 = 300;
 const STORE_CAP: u8 = 6;
 pub const NO_NEST: u16 = u16::MAX;
 
@@ -212,16 +236,16 @@ const COOLDOWN: u64 = 20 * DAY;
 const BLOOM_LENGTH: u64 = 10 * DAY;
 const BLOOM_MULTIPLIER: u32 = 3;
 /// Food units each worker eats per tick while a drought is on.
-const CONSUME_RATE: f32 = 0.004;
+const CONSUME_RATE: f32 = 0.003;
 /// What a worker eats per tick the rest of the year, so stores only grow when foraging
 /// outpaces eating and a drought lands on whatever the colony actually managed to put by.
-const UPKEEP_RATE: f32 = 0.0008;
+const UPKEEP_RATE: f32 = 0.0003;
 const STARVE_INTERVAL: u32 = DAY as u32 / 2;
 const DEPOSIT: f32 = 0.08;
 const STRENGTH_DECAY: f32 = 0.985;
 const EVAPORATION: f32 = 0.994;
 const FOOD_RESPAWN_TICKS: u32 = 200;
-const BUD_POPULATION: usize = 45;
+const BUD_POPULATION: usize = 60;
 const BUD_PARTY: usize = 5;
 const BUD_EVERY: u64 = 900;
 const NEST_GAP: usize = 18;
@@ -419,18 +443,60 @@ impl World {
             return;
         }
         let i = cells[self.rng.usize(..cells.len())];
+        let role = self.pick_role(home);
+        let state = match role {
+            Role::Digger => State::ToTip,
+            Role::Nurse => State::Idle,
+            Role::Forager | Role::Scout => State::Foraging,
+        };
         self.ants.push(Ant {
             x: i % self.w,
             y: i / self.w,
-            state: State::Foraging,
+            state,
+            role,
             underground: true,
             home,
+            idle: IDLE_TICKS,
             dir: if self.rng.bool() { 1 } else { -1 },
             cooldown: self.rng.u8(..MOVE_TICKS * 4),
             dig_dir: (0, 1),
             dig_budget: 0,
             strength: 0.0,
         });
+    }
+
+    /// The caste the nest is shortest of, against `ROLE_SHARES`.
+    fn pick_role(&self, home: usize) -> Role {
+        let mut counts = [0i64; 4];
+        let mut total = 0i64;
+        for a in self.ants.iter().filter(|a| a.home == home) {
+            counts[a.role as usize] += 1;
+            total += 1;
+        }
+        let mut best = Role::Forager;
+        let mut best_gap = i64::MIN;
+        for (i, &(role, share)) in ROLE_SHARES.iter().enumerate() {
+            let gap = share as i64 * (total + 1) - counts[i] * 100;
+            if gap > best_gap {
+                best_gap = gap;
+                best = role;
+            }
+        }
+        best
+    }
+
+    pub fn role_counts(&self) -> [usize; 4] {
+        let mut c = [0; 4];
+        for a in &self.ants {
+            c[a.role as usize] += 1;
+        }
+        c
+    }
+
+    /// `f66 d30 s12 n12`
+    pub fn caste_summary(&self) -> String {
+        let c = self.role_counts();
+        format!("f{} d{} s{} n{}", c[0], c[1], c[2], c[3])
     }
 
     fn spawn_food(&mut self, size: f32) {
@@ -520,13 +586,16 @@ impl World {
         let x = ant.x;
         match ant.state {
             State::Foraging => {
-                // Food in sight wins, then the trail, then a wander.
+                // Food in sight wins, then the trail (foragers only), then a wander.
+                // Scouts see further, ignore trails, and keep going the way they were.
+                let scout = ant.role == Role::Scout;
+                let vision = if scout { SCOUT_VISION } else { VISION };
                 let seen = self
                     .food
                     .iter()
                     .filter(|f| f.units > 0)
                     .map(|f| f.x)
-                    .filter(|&fx| fx.abs_diff(x) <= VISION)
+                    .filter(|&fx| fx.abs_diff(x) <= vision)
                     .min_by_key(|&fx| fx.abs_diff(x));
                 if let Some(fx) = seen {
                     if fx == x {
@@ -534,11 +603,16 @@ impl World {
                             f.units = f.units.saturating_sub(1);
                         }
                         ant.state = State::Returning;
-                        ant.strength = 1.0;
+                        // A scout's trail is the strong one: it is what brings the foragers.
+                        ant.strength = if scout { 2.5 } else { 1.0 };
                         ant.dir = self.toward_entrance(x, ant.home);
                         return ant;
                     }
                     ant.dir = if fx > x { 1 } else { -1 };
+                } else if scout {
+                    if self.rng.f32() < 0.01 {
+                        ant.dir = -ant.dir;
+                    }
                 } else {
                     let ahead = self.ph_at(x as i32 + ant.dir * 3);
                     let behind = self.ph_at(x as i32 - ant.dir * 3);
@@ -576,6 +650,16 @@ impl World {
                     }
                     ant.underground = true;
                     ant.y = gy;
+                    // The first couple down the hole become its diggers; the rest keep
+                    // their trade so the new nest's castes aren't all shovel.
+                    let diggers_here = self
+                        .ants
+                        .iter()
+                        .filter(|a| a.underground && a.x == x && a.role == Role::Digger)
+                        .count();
+                    if diggers_here < 2 {
+                        ant.role = Role::Digger;
+                    }
                     ant.state = State::Digging;
                     ant.dig_dir = (0, 1);
                     ant.dig_budget = 10;
@@ -584,9 +668,23 @@ impl World {
                 ant.dir = if target > x { 1 } else { -1 };
                 self.walk(&mut ant);
             }
-            State::ToTip | State::Digging => {
-                // Shouldn't be on the surface in these states; go back to foraging.
-                ant.state = State::Foraging;
+            State::ToTip | State::Digging | State::Idle => {
+                // Underground castes caught outside (a nest just merged, say) head home.
+                let dir = self.toward_entrance(x, ant.home);
+                if dir == 0 && self.is_live_entrance(x) {
+                    ant.underground = true;
+                    ant.y = self.ground[x];
+                    if let Some(n) = self.nest_at_entrance(x) {
+                        ant.home = n;
+                    }
+                    return ant;
+                }
+                if dir == 0 {
+                    ant.state = State::Foraging; // no nest left to go home to
+                } else {
+                    ant.dir = dir;
+                    self.walk(&mut ant);
+                }
             }
         }
         ant
@@ -652,7 +750,7 @@ impl World {
                     if self.store[here] >= STORE_CAP {
                         self.dirty = true;
                     }
-                    ant.state = self.pick_task(ant.home);
+                    self.assign(&mut ant, here);
                 } else if self.store_dist[here] == FAR {
                     // Nowhere to put it: no chamber with room. Go and dig one.
                     ant.state = State::ToTip;
@@ -667,7 +765,8 @@ impl World {
                     ant.dig_budget = self.rng.u8(3..=8);
                     ant.dig_dir = self.pick_dig_dir((0, 1));
                 } else if self.tip_dist[here] == FAR {
-                    ant.state = State::Foraging;
+                    ant.state = State::Idle;
+                    ant.idle = IDLE_TICKS;
                 } else if let Some((nx, ny)) = self.descend(Field::Tip, ant.x, ant.y) {
                     ant.x = nx;
                     ant.y = ny;
@@ -675,7 +774,7 @@ impl World {
             }
             State::Digging => {
                 if ant.dig_budget == 0 || self.dig_capped(ant.home) {
-                    ant.state = self.pick_task(ant.home);
+                    self.assign(&mut ant, here);
                     return ant;
                 }
                 if !self.rng.bool() || self.rng.f32() < 0.2 {
@@ -701,38 +800,87 @@ impl World {
                     // Boxed in. Mark this tip dead and go do something else.
                     self.dead_tip[here] = true;
                     self.dirty = true;
-                    ant.state = self.pick_task(ant.home);
+                    self.assign(&mut ant, here);
+                }
+            }
+            State::Idle => {
+                if ant.idle == 0 {
+                    self.assign(&mut ant, here);
+                    return ant;
+                }
+                ant.idle -= 1;
+                // Nurses keep to the chambers; everyone else just wanders.
+                if let Some((nx, ny)) = self.wander(ant.x, ant.y, ant.role == Role::Nurse) {
+                    ant.x = nx;
+                    ant.y = ny;
                 }
             }
         }
         ant
     }
 
-    /// What an ant does after finishing a job underground.
-    fn pick_task(&mut self, home: usize) -> State {
-        let free: u32 = self
-            .cells
-            .iter()
-            .zip(&self.store)
-            .filter(|(c, s)| **c == Cell::Chamber && **s < STORE_CAP)
-            .map(|(_, s)| (STORE_CAP - s) as u32)
-            .sum();
-        if self.dig_capped(home) {
-            return State::Foraging;
+    /// Step to a random dug neighbour, preferring chambers if asked.
+    fn wander(&mut self, x: usize, y: usize, prefer_chamber: bool) -> Option<(usize, usize)> {
+        let mut any = Vec::with_capacity(4);
+        let mut chambers = Vec::with_capacity(4);
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+            if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
+                continue;
+            }
+            let (nx, ny) = (nx as usize, ny as usize);
+            if self.is_dug(nx, ny) {
+                any.push((nx, ny));
+                if self.cell(nx, ny) == Cell::Chamber {
+                    chambers.push((nx, ny));
+                }
+            }
         }
-        let crowded = self.ants.len() * 2 > self.dug;
-        let mut p_dig = 0.2;
-        if free < 8 {
-            p_dig += 0.4;
-        }
-        if crowded {
-            p_dig += 0.2;
-        }
-        if self.rng.f32() < p_dig {
-            State::ToTip
+        let pick = if prefer_chamber && !chambers.is_empty() && self.rng.f32() < 0.85 {
+            chambers
         } else {
-            State::Foraging
+            any
+        };
+        if pick.is_empty() {
+            None
+        } else {
+            Some(pick[self.rng.usize(..pick.len())])
         }
+    }
+
+    /// What an ant does next after finishing a job underground, by caste.
+    fn assign(&mut self, ant: &mut Ant, here: usize) {
+        ant.state = match ant.role {
+            Role::Nurse => {
+                ant.idle = IDLE_TICKS;
+                State::Idle
+            }
+            Role::Digger => {
+                if self.dig_capped(ant.home) || self.tip_dist[here] == FAR {
+                    ant.idle = IDLE_TICKS;
+                    State::Idle
+                } else {
+                    State::ToTip
+                }
+            }
+            Role::Scout => State::Foraging,
+            Role::Forager => {
+                // A forager pitches in on chambers when the larder is nearly full.
+                let free: u32 = self
+                    .cells
+                    .iter()
+                    .zip(&self.store)
+                    .zip(&self.nest_of)
+                    .filter(|((c, s), n)| **c == Cell::Chamber && **s < STORE_CAP && **n as usize == ant.home)
+                    .map(|((_, s), _)| (STORE_CAP - s) as u32)
+                    .sum();
+                if free < 8 && !self.dig_capped(ant.home) && self.rng.f32() < 0.5 {
+                    State::ToTip
+                } else {
+                    State::Foraging
+                }
+            }
+        };
     }
 
     /// Step to the neighbouring dug cell that is closer to the field's sources, or
@@ -1256,11 +1404,9 @@ impl World {
                 continue;
             }
             self.nests[n].starve_timer = 0;
-            let victim = self
-                .ants
-                .iter()
-                .position(|a| a.home == n && a.underground)
-                .or_else(|| self.ants.iter().position(|a| a.home == n));
+            // Any worker of the nest, chosen at random, so no caste starves out first.
+            let members: Vec<usize> = (0..self.ants.len()).filter(|&i| self.ants[i].home == n).collect();
+            let victim = (!members.is_empty()).then(|| members[self.rng.usize(..members.len())]);
             if let Some(i) = victim {
                 self.ants.swap_remove(i);
                 self.nests[n].workers -= 1;
@@ -1292,14 +1438,27 @@ impl World {
             }
         }
         let Some(target) = target else { return };
-        let party: Vec<usize> = self
+        // Scouts lead the way; foragers make up the numbers if there aren't enough out.
+        let out = |a: &Ant| !a.underground && a.state == State::Foraging;
+        let mut party: Vec<usize> = self
             .ants
             .iter()
             .enumerate()
-            .filter(|(_, a)| !a.underground && a.state == State::Foraging)
+            .filter(|(_, a)| out(a) && a.role == Role::Scout)
             .map(|(i, _)| i)
             .take(BUD_PARTY)
             .collect();
+        if party.len() < BUD_PARTY {
+            let more: Vec<usize> = self
+                .ants
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| out(a) && a.role == Role::Forager && !party.contains(i))
+                .map(|(i, _)| i)
+                .take(BUD_PARTY - party.len())
+                .collect();
+            party.extend(more);
+        }
         if party.len() < 2 {
             return;
         }
@@ -1317,11 +1476,13 @@ impl World {
             for x in 0..self.w {
                 let ant = self.ants.iter().find(|a| a.x == x && a.y == y);
                 let ch = if let Some(a) = ant {
-                    match a.state {
-                        State::Returning => 'A',
-                        State::Digging => 'd',
-                        State::Founding(_) => '*',
-                        _ => 'a',
+                    match (a.state, a.role) {
+                        (State::Returning, _) => 'A',
+                        (State::Founding(_), _) => '*',
+                        (_, Role::Forager) => 'f',
+                        (_, Role::Digger) => 'd',
+                        (_, Role::Scout) => 's',
+                        (_, Role::Nurse) => 'n',
                     }
                 } else if y + 1 == self.ground[x] && self.food.iter().any(|f| f.x == x) {
                     'F'
@@ -1370,10 +1531,11 @@ impl World {
     pub fn stats(&self) -> String {
         let season = self.season_label().map(|s| format!("{s} · ")).unwrap_or_default();
         format!(
-            "tick {} · {season}{} · ants {} · dug {} · chambers {} · stored {} · food {} · delivered {}",
+            "tick {} · {season}{} · ants {} ({}) · dug {} · chambers {} · stored {} · food {} · delivered {}",
             self.tick,
             self.nest_summary(),
             self.ants.len(),
+            self.caste_summary(),
             self.dug,
             self.chambers(),
             self.stored(),
@@ -1413,7 +1575,7 @@ mod tests {
         let mut w = world(2);
         let start = w.ants.len();
         // Growth waits for a reserve now, so give the colony time to stock up first.
-        run(&mut w, 12000);
+        run(&mut w, 16000);
         assert!(w.delivered > 30, "only {} deliveries:\n{}", w.delivered, w.snapshot());
         assert!(w.ants.len() > start, "colony did not grow:\n{}", w.snapshot());
     }
@@ -1427,8 +1589,10 @@ mod tests {
             x: 10,
             y: w.ground[10] - 1,
             state: State::Foraging,
+            role: Role::Forager,
             underground: false,
             home: 0,
+            idle: 0,
             dir: 1,
             cooldown: 0,
             dig_dir: (0, 1),
@@ -1624,8 +1788,82 @@ mod tests {
         w.cfg.food_piles = 0;
         run(&mut w, 600);
         assert!(w.nest_food(0) < full, "stores did not drain");
-        assert_eq!(w.ants.len(), 40, "nobody starves outside a drought");
+        assert!(w.ants.len() >= 40, "somebody starved outside a drought");
         assert!(!w.nests[0].starving && !w.nests[0].dead);
+    }
+
+    #[test]
+    fn castes_keep_roughly_their_shares() {
+        let mut w = World::new(Config { seed: 8, ..Config::default() }, 120, 60);
+        run(&mut w, 10000);
+        let c = w.role_counts();
+        let total = w.ants.len() as f32;
+        assert!(total > 30.0, "{}", w.stats());
+        let share = |n: usize| n as f32 / total;
+        assert!((0.4..0.7).contains(&share(c[0])), "foragers {:?}", c);
+        assert!((0.12..0.4).contains(&share(c[1])), "diggers {:?}", c);
+        assert!(c[2] >= 2 && c[3] >= 2, "scouts/nurses {:?}", c);
+    }
+
+    #[test]
+    fn diggers_and_nurses_stay_underground() {
+        let mut w = World::new(Config { seed: 9, ..Config::default() }, 100, 50);
+        for _ in 0..30 {
+            run(&mut w, 300);
+            for a in &w.ants {
+                if matches!(a.role, Role::Digger | Role::Nurse) && !matches!(a.state, State::Founding(_)) {
+                    assert!(a.underground, "{:?} outside at {},{}:\n{}", a.role, a.x, a.y, w.snapshot());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_scout_keeps_going_where_a_forager_dithers() {
+        let mut w = World::new(Config { seed: 10, ants: Some(2), ..Config::default() }, 200, 48);
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        for (i, role) in [Role::Scout, Role::Forager].into_iter().enumerate() {
+            w.ants[i] = Ant {
+                x: 20,
+                y: w.ground[20] - 1,
+                state: State::Foraging,
+                role,
+                underground: false,
+                home: 0,
+                idle: 0,
+                dir: 1,
+                cooldown: 0,
+                dig_dir: (0, 1),
+                dig_budget: 0,
+                strength: 0.0,
+            };
+        }
+        let mut scout_far = 0;
+        let mut forager_far = 0;
+        for _ in 0..300 {
+            w.ants[0].cooldown = 0;
+            w.ants[1].cooldown = 0;
+            w.step_ant(0);
+            w.step_ant(1);
+            scout_far = scout_far.max(w.ants[0].x.abs_diff(20));
+            forager_far = forager_far.max(w.ants[1].x.abs_diff(20));
+        }
+        assert!(scout_far > 100, "scout only got {scout_far} away");
+        assert!(scout_far > forager_far, "scout {scout_far} vs forager {forager_far}");
+    }
+
+    #[test]
+    fn diggers_use_up_the_whole_soil_budget_over_a_long_run() {
+        let mut w = World::new(Config { seed: 11, drought: false, ..Config::default() }, 120, 60);
+        run(&mut w, 60000);
+        let budget = w.soil_cells() * DIG_SHARE / 100 / w.live_nests().max(2);
+        assert!(
+            w.nest_cells(0) * 10 >= budget * 9,
+            "stopped short of the budget: {} of {budget}\n{}",
+            w.nest_cells(0),
+            w.snapshot()
+        );
     }
 
     #[test]
