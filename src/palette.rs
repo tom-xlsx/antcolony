@@ -12,7 +12,9 @@ pub const CHAMBER: Rgb = (42, 30, 20);
 pub const FOOD: Rgb = (92, 200, 72);
 pub const TRAIL: Rgb = (214, 152, 42);
 pub const ANT: Rgb = (236, 232, 220);
-pub const ANT_CARRYING: Rgb = (190, 240, 150);
+/// An ant with a unit of food on its back: ivory with a warm cast, so it reads as an ant,
+/// not as a bit of larder on the move.
+pub const ANT_CARRYING: Rgb = (255, 236, 170);
 pub const ANT_DIGGING: Rgb = (224, 188, 132);
 pub const ANT_FOUNDING: Rgb = (255, 196, 110);
 pub const ANT_SCOUT: Rgb = (150, 200, 255);

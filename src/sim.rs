@@ -348,8 +348,9 @@ const QUEEN_FETCHERS: usize = 3;
 const QUEEN_PANTRY_FOOD: u32 = 30;
 const QUEEN_PANTRY: usize = 3;
 /// Traffic (recent passes, halved every `TRAFFIC_HALF_LIFE` ticks) above which an idle
-/// digger will widen a corridor cell to two wide.
+/// digger will widen a corridor cell, up to `MAX_WIDTH` cells across.
 const WIDEN_TRAFFIC: u16 = 30;
+const MAX_WIDTH: usize = 3;
 const TRAFFIC_HALF_LIFE: u64 = 200;
 /// Dead-tip marks expire so a boxed-in spot gets another look once things have changed.
 const DEAD_TIP_TTL: u64 = 3000;
@@ -366,6 +367,9 @@ const LAY_MIN_DAYS: f32 = 12.0;
 const FOUNDING_WORKERS: usize = 3;
 /// With no queen anywhere for this long, a new founding queen arrives from outside.
 const REFOUND_AFTER: u64 = 50 * DAY;
+/// A nest that has lost its queen fills back in from its extremities, one cell this often,
+/// so the ground is free for whoever comes next.
+const DECAY_TICKS: u64 = 30;
 const HATCH_TIME: u64 = 600;
 const QUEEN_TICKS: u8 = 10;
 const SETTLE_TIME: u64 = 500;
@@ -920,10 +924,63 @@ impl World {
         if self.cfg.bud && self.cfg.grow && self.tick.is_multiple_of(BUD_EVERY) {
             self.maybe_bud();
         }
+        if self.tick.is_multiple_of(DECAY_TICKS) {
+            self.decay();
+        }
         if self.nests.iter().any(|n| !n.dead && n.queen.is_some()) {
             self.last_queen_seen = self.tick;
         } else if self.cfg.grow && self.tick - self.last_queen_seen > REFOUND_AFTER {
             self.refound();
+        }
+    }
+
+    /// Queenless nests and stray fragments of tunnel crumble back to soil from their tips
+    /// inward, one cell per call per system, leaving the entrance for last.
+    fn decay(&mut self) {
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); self.nests.len() + 1];
+        for i in 0..self.cells.len() {
+            if !self.cells[i].dug() {
+                continue;
+            }
+            let n = self.nest_of[i];
+            let decaying = n == NO_NEST || self.nests[n as usize].dead || self.nests[n as usize].queen_lost && self.nests[n as usize].queen.is_none();
+            // Only the edge crumbles: cells with soil beside them, leaves first.
+            if !decaying || self.dug_neighbours(i) == 4 || self.store[i] > 0 {
+                continue;
+            }
+            let (x, y) = (i % self.w, i / self.w);
+            let occupied = self.ants.iter().any(|a| a.underground && a.x == x && a.y == y)
+                || self.eggs.iter().any(|e| e.cell == i)
+                || self.nests.iter().any(|nst| nst.queen.as_ref().is_some_and(|q| (q.x, q.y) == (x, y)));
+            if occupied {
+                continue;
+            }
+            let is_entrance = y == self.ground[x] && self.entrances.contains(&x);
+            let last = n == NO_NEST || self.nest_cells(n as usize) <= 1;
+            if is_entrance && !last {
+                continue;
+            }
+            let g = if n == NO_NEST { self.nests.len() } else { n as usize };
+            groups[g].push(i);
+        }
+        for cells in groups {
+            if cells.is_empty() {
+                continue;
+            }
+            let leaves: Vec<usize> = cells.iter().copied().filter(|&i| self.dug_neighbours(i) <= 1).collect();
+            let pick = if leaves.is_empty() { &cells } else { &leaves };
+            let i = pick[self.rng.usize(..pick.len())];
+            let (x, y) = (i % self.w, i / self.w);
+            self.cells[i] = Cell::Soil;
+            self.widened[i] = false;
+            self.dead_tip[i] = false;
+            self.traffic[i] = 0;
+            self.dug = self.dug.saturating_sub(1);
+            self.corpses.retain(|c| (c.x, c.y) != (x, y)); // buried
+            if y == self.ground[x] {
+                self.entrances.retain(|&e| e != x);
+            }
+            self.dirty = true;
         }
     }
 
@@ -1539,9 +1596,9 @@ impl World {
         }
     }
 
-    /// A soil cell beside a busy corridor cell that an idle digger may open to make the
-    /// corridor two wide. Only corridors (two opposite dug neighbours), only once, and
-    /// never near the surface or another tunnel.
+    /// A soil cell beside a busy corridor cell that an idle digger may open, widening the
+    /// corridor up to `MAX_WIDTH` across. Only corridors (two opposite dug neighbours whose
+    /// other two sides are soil or earlier widening), never near the surface or another tunnel.
     fn widen_spot(&mut self, here: usize) -> Option<usize> {
         if self.cells[here] != Cell::Tunnel || self.traffic[here] < WIDEN_TRAFFIC || self.widened[here] {
             return None;
@@ -1550,9 +1607,12 @@ impl World {
         if x < 2 || y < 2 || x + 2 >= self.w || y + 2 >= self.h || y < self.ground[x] + 3 {
             return None;
         }
-        let dug = |w: &Self, dx: i32, dy: i32| w.is_dug((x as i32 + dx) as usize, (y as i32 + dy) as usize);
-        let horizontal = dug(self, 1, 0) && dug(self, -1, 0) && !dug(self, 0, 1) && !dug(self, 0, -1);
-        let vertical = dug(self, 0, 1) && dug(self, 0, -1) && !dug(self, 1, 0) && !dug(self, -1, 0);
+        let at = |w: &Self, dx: i32, dy: i32| w.idx((x as i32 + dx) as usize, (y as i32 + dy) as usize);
+        let dug = |w: &Self, dx: i32, dy: i32| w.cells[at(w, dx, dy)].dug();
+        // A side is "open" if it is soil or one of our own widened cells.
+        let side_ok = |w: &Self, dx: i32, dy: i32| !dug(w, dx, dy) || w.widened[at(w, dx, dy)];
+        let horizontal = dug(self, 1, 0) && dug(self, -1, 0) && side_ok(self, 0, 1) && side_ok(self, 0, -1);
+        let vertical = dug(self, 0, 1) && dug(self, 0, -1) && side_ok(self, 1, 0) && side_ok(self, -1, 0);
         let sides: [(i32, i32); 2] = if horizontal {
             [(0, 1), (0, -1)]
         } else if vertical {
@@ -1560,6 +1620,10 @@ impl World {
         } else {
             return None;
         };
+        let already = sides.iter().filter(|&&(dx, dy)| dug(self, dx, dy)).count();
+        if already + 1 >= MAX_WIDTH {
+            return None;
+        }
         let first = self.rng.bool();
         for &(dx, dy) in [sides[first as usize], sides[!first as usize]].iter() {
             let (cx, cy) = ((x as i32 + dx) as usize, (y as i32 + dy) as usize);
@@ -2956,7 +3020,33 @@ mod tests {
             w.traffic[here] = WIDEN_TRAFFIC + 50;
             widened = [(ex - 1, y), (ex + 1, y)].iter().filter(|&&(x, yy)| w.is_dug(x, yy)).count();
         }
-        assert_eq!(widened, 1, "corridor should be exactly two wide:\n{}", w.snapshot());
+        assert_eq!(widened, 2, "corridor should end up exactly three wide:\n{}", w.snapshot());
+        // And never wider: the cells either side of the widened ones stay soil.
+        assert!(!w.is_dug(ex - 2, y) && !w.is_dug(ex + 2, y), "{}", w.snapshot());
+    }
+
+    #[test]
+    fn a_queenless_nest_crumbles_back_to_soil_from_its_tips() {
+        let mut w = World::new(Config { seed: 17, ants: Some(0), bud: false, drought: false, grow: false, ..Config::default() }, 90, 48);
+        run(&mut w, 1);
+        let cells = w.nest_cells(0);
+        assert!(cells > 10);
+        w.nests[0].queen = None;
+        w.nests[0].queen_lost = true;
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        for i in 0..w.store.len() {
+            w.store[i] = 0;
+        }
+        run(&mut w, DECAY_TICKS * 6);
+        let later = w.nest_cells(0);
+        assert!(later < cells && later > 0, "{cells} -> {later}:\n{}", w.snapshot());
+        let ex = w.entrances[0];
+        assert!(w.is_dug(ex, w.ground[ex]), "entrance should go last");
+        // Long enough and it is all soil again, entrance included; the next queen starts fresh.
+        run(&mut w, DECAY_TICKS * (cells as u64 + 5));
+        assert!(w.cells.iter().all(|c| !c.dug()), "{}", w.snapshot());
+        assert!(w.entrances.is_empty());
     }
 
     #[test]
@@ -2979,7 +3069,7 @@ mod tests {
         w.nests[0].queen_lost = true;
         w.food.clear();
         w.cfg.food_piles = 0;
-        run(&mut w, REFOUND_AFTER + 5);
+        run(&mut w, REFOUND_AFTER + 5); // the old nest has mostly crumbled by now
         assert!(w.nests.iter().any(|n| !n.dead && n.queen.is_some()), "nobody came:\n{}", w.snapshot());
         // She lays from her reserve with no workers and no larder.
         run(&mut w, LAY_INTERVAL + HATCH_TIME + 10);

@@ -42,15 +42,17 @@ would see the nest through twelve days of drought; the egg hatches into a worker
 hundred ticks later. That is the only way the world gains ants. If she
 dies the nest is doomed: no more eggs, and once the rooms are eaten bare the workers walk off
 to join the nearest nest that still has a queen. Her corpse lies in the chamber for a while.
-If the whole farm goes queenless for fifty days, a founding queen flies in from outside, digs
-a short shaft and lays from her own reserve until she has a few workers.
+A queenless nest crumbles slowly back into soil from its tips inward, entrance last, so the
+ground is free for whoever comes next. If the whole farm goes queenless for fifty days, a
+founding queen flies in from outside, digs a short shaft and lays from her own reserve until
+she has a few workers.
 
 Workers have jobs, not castes. A job is reassigned when the nest's larder changes, one ant at
 a time so you can watch the workforce pivot.
 
 | Job | Colour | Does |
 |---|---|---|
-| Forager | ivory | works the surface near home, follows trails, hauls food (green while carrying) |
+| Forager | ivory | works the surface near home, follows trails, hauls food (pale gold while carrying) |
 | Nurse | pink | keeps to the rooms, feeds the queen and hungry diggers, minds the stores |
 | Digger | tan | extends tunnels and rooms; digs the royal chamber when the nest is ready |
 | Scout | pale blue | ranges the whole surface, sees further, lays the strong trail, leads founding parties (orange on the march) |
@@ -68,7 +70,8 @@ on digging until its first room is open.
 Every ant has a belly. Foragers eat on the surface or at the store, nurses from the rooms they
 stand in, diggers are fed by nurses or, if nobody comes, walk to the larder. When the queen
 runs low a couple of nurses fetch a unit each from the nearest room that has any and carry it
-to her (green while carrying).
+to her (pale gold while carrying). Stored food is the floor of a room itself, shading from
+brown toward green as it fills.
 Hunger runs six times faster in a drought. An ant that runs empty drops its job and its load,
 goes dim, then dark red, and dies: on the surface after a few steps, underground on reaching
 a room. Corpses lie where they fell and fade. The queen carries a much larger reserve, so in a
@@ -135,7 +138,7 @@ is hollow. On the surface a one-dimensional trail of pheromone leads foragers to
 
 A nest is one connected tunnel system. Each living nest may hollow out a share of the soil
 (two-fifths of it between them; a lone nest gets a fifth), so diggers work until that is used
-and then idle in the tunnels, widening the busiest corridors to two cells as they loiter. Food goes into rooms; every ant eats from it; the queen turns a
+and then idle in the tunnels, widening the busiest corridors to three cells as they loiter. Food goes into rooms; every ant eats from it; the queen turns a
 full belly into eggs. Tuned so that on a 120×40 pane most droughts kill a nest or two and
 none wipe the farm, and restocking takes a good part of the gap between droughts.
 
