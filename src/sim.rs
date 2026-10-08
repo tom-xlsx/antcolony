@@ -680,6 +680,26 @@ impl World {
         [base[0] - scouts, base[1], base[2], scouts]
     }
 
+    /// Target head counts per job for a nest of `total` workers: shares rounded, then a
+    /// floor so even a small nest keeps a digger and a scout, and nurses for the queen.
+    fn job_quotas(&self, n: usize, total: usize) -> [usize; 4] {
+        let shares = self.job_targets(n);
+        let mut q = [0usize; 4];
+        for i in 0..4 {
+            q[i] = (shares[i] as usize * total + 50) / 100;
+        }
+        if shares[2] > 0 && total >= 4 {
+            q[2] = q[2].max(1);
+        }
+        if shares[3] > 0 && total >= 6 {
+            q[3] = q[3].max(1);
+        }
+        if self.nests[n].queen.is_some() && shares[1] > 0 {
+            q[1] = q[1].max(MIN_NURSES.min(total.saturating_sub(1)));
+        }
+        q
+    }
+
     fn job_counts(&self, n: usize) -> [usize; 4] {
         let mut c = [0; 4];
         for a in self.ants.iter().filter(|a| a.home == n && a.state != State::Starving) {
@@ -690,13 +710,13 @@ impl World {
 
     /// The job the nest is shortest of, for a newly hatched ant.
     fn pick_job(&self, n: usize) -> Job {
-        let targets = self.job_targets(n);
         let counts = self.job_counts(n);
-        let total = counts.iter().sum::<usize>() as i64 + 1;
+        let total = counts.iter().sum::<usize>() + 1;
+        let quotas = self.job_quotas(n, total);
         let mut best = Job::Forager;
         let mut best_gap = i64::MIN;
         for (i, job) in [Job::Forager, Job::Nurse, Job::Digger, Job::Scout].into_iter().enumerate() {
-            let gap = targets[i] as i64 * total - counts[i] as i64 * 100;
+            let gap = quotas[i] as i64 - counts[i] as i64;
             if gap > best_gap {
                 best_gap = gap;
                 best = job;
@@ -729,13 +749,13 @@ impl World {
             if self.nests[n].dead {
                 continue;
             }
-            let targets = self.job_targets(n);
             let counts = self.job_counts(n);
-            let total = counts.iter().sum::<usize>() as i64;
+            let total = counts.iter().sum::<usize>();
             if total == 0 {
                 continue;
             }
-            let gap = |i: usize| targets[i] as i64 * total - counts[i] as i64 * 100;
+            let quotas = self.job_quotas(n, total);
+            let gap = |i: usize| quotas[i] as i64 - counts[i] as i64;
             let (mut need, mut need_gap) = (0, i64::MIN);
             let (mut spare, mut spare_gap) = (0, i64::MAX);
             for i in 0..4 {
@@ -748,11 +768,11 @@ impl World {
                     spare_gap = gap(i);
                 }
             }
-            if let Some(z) = (0..4).find(|&i| targets[i] == 0 && counts[i] > 0) {
+            if let Some(z) = (0..4).find(|&i| quotas[i] == 0 && counts[i] > 0) {
                 spare = z;
                 spare_gap = -1;
             }
-            if need_gap <= 100 || spare_gap >= 0 {
+            if need_gap <= 0 || spare_gap >= 0 {
                 continue;
             }
             let queen_alive = self.nests[n].queen.is_some();
@@ -963,13 +983,21 @@ impl World {
             let g = if n == NO_NEST { self.nests.len() } else { n as usize };
             groups[g].push(i);
         }
-        for cells in groups {
+        for (g, cells) in groups.into_iter().enumerate() {
             if cells.is_empty() {
                 continue;
             }
-            let leaves: Vec<usize> = cells.iter().copied().filter(|&i| self.dug_neighbours(i) <= 1).collect();
-            let pick = if leaves.is_empty() { &cells } else { &leaves };
-            let i = pick[self.rng.usize(..pick.len())];
+            // Erode from the extremities: fewest dug neighbours first, then the deepest and
+            // the farthest from the entrance, so corridors shorten from their ends and rooms
+            // shrink evenly instead of being gnawed into odd snakes.
+            let ex = self.nests.get(g).and_then(|n| n.entrances.first().copied()).unwrap_or(self.w / 2);
+            let key = |w: &Self, i: usize| {
+                let (x, y) = (i % w.w, i / w.w);
+                (w.dug_neighbours(i), std::cmp::Reverse(y + x.abs_diff(ex)))
+            };
+            let best = cells.iter().map(|&i| key(self, i)).min().unwrap();
+            let ties: Vec<usize> = cells.iter().copied().filter(|&i| key(self, i) == best).collect();
+            let i = ties[self.rng.usize(..ties.len())];
             let (x, y) = (i % self.w, i / self.w);
             self.cells[i] = Cell::Soil;
             self.widened[i] = false;
@@ -1236,7 +1264,7 @@ impl World {
                 if self.tip_dist[here] == 0 {
                     ant.state = State::Digging;
                     ant.dig_budget = self.rng.u8(3..=8);
-                    ant.dig_dir = self.pick_dig_dir((0, 1));
+                    ant.dig_dir = if self.cells[here].room() { (0, 1) } else { self.pick_dig_dir((0, 1)) };
                 } else if self.tip_dist[here] == FAR {
                     ant.state = State::Idle;
                     ant.idle = IDLE_TICKS;
@@ -1983,6 +2011,9 @@ impl World {
                 if ax.abs_diff(fx) <= 2 && ay.abs_diff(fy) <= 2 {
                     continue; // the tunnel we came from
                 }
+                if self.cell(ax, ay).room() && ax.abs_diff(fx) <= 3 && ay.abs_diff(fy) <= 3 {
+                    continue; // our own room, when digging out of it
+                }
                 if self.is_dug(ax, ay) && !self.is_husk(ax, ay) {
                     return false; // breaking into a husk is fine: that is how it gets reused
                 }
@@ -2004,7 +2035,7 @@ impl World {
         let depth = y.saturating_sub(self.ground[x]);
         // A nest without a queen yet is desperate for its first room.
         let young = self.nests.get(home).is_some_and(|n| n.queen.is_none() && !n.queen_lost);
-        let (min_depth, p_room) = if young { (3, 0.5) } else { (4, 0.12) };
+        let (min_depth, p_room) = if young { (4, 0.5) } else { (4, 0.12) };
         if depth >= min_depth && self.rng.f32() < p_room && !self.chamber_near(x, y, 5) {
             let rx = self.rng.usize(2..=3);
             let ry = self.rng.usize(1..=2);
@@ -2136,8 +2167,16 @@ impl World {
         let mut tips: Vec<usize> = (0..n)
             .filter(|&i| usable(self, i) && self.dug_neighbours(i) <= 1 && i / self.w > self.ground[i % self.w])
             .collect();
-        if tips.is_empty() {
-            tips = (0..n).filter(|&i| usable(self, i)).collect();
+        // A nest with no proper tip (a shaft running straight into its room, say) may dig
+        // from any of its tunnel cells; this has to be judged nest by nest.
+        for nest in 0..self.nests.len() {
+            if self.nests[nest].dead || tips.iter().any(|&i| self.nest_of[i] as usize == nest) {
+                continue;
+            }
+            let floor = |w: &Self, i: usize| {
+                w.cells[i].room() && i + w.w < n && w.cells[i + w.w] == Cell::Soil && !w.dead_tip[i]
+            };
+            tips.extend((0..n).filter(|&i| self.nest_of[i] as usize == nest && (usable(self, i) || floor(self, i))));
         }
         self.tip_dist = self.bfs(&tips);
 
@@ -2995,7 +3034,7 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_digger_widens_a_busy_corridor_but_only_to_two() {
+    fn an_idle_digger_widens_a_busy_corridor_but_only_to_three() {
         let mut w = World::new(Config { seed: 14, ants: Some(1), bud: false, drought: false, ..Config::default() }, 71, 48);
         let ex = w.entrances[0];
         let g = w.ground[ex];
@@ -3015,6 +3054,7 @@ mod tests {
 
             w.ants[0].x = ex;
             w.ants[0].y = y;
+            w.ants[0].job = Job::Digger; // a nest of one would otherwise stand its digger down
             w.ants[0].state = State::Idle;
             w.ants[0].idle = 5000;
             w.traffic[here] = WIDEN_TRAFFIC + 50;
@@ -3077,6 +3117,87 @@ mod tests {
     }
 
     #[test]
+    fn even_a_small_nest_keeps_a_digger() {
+        let mut w = World::new(Config { seed: 18, ants: Some(5), bud: false, drought: false, ..Config::default() }, 90, 48);
+        fill_nest(&mut w, 0);
+        for a in &mut w.ants {
+            a.job = Job::Forager;
+            a.state = State::Foraging;
+        }
+        for _ in 0..600 {
+            w.tick();
+            if w.tick.is_multiple_of(50) {
+                fill_nest(&mut w, 0);
+            }
+        }
+        let c = w.job_tally();
+        assert!(c[2] >= 1, "no digger in a nest of {}: {:?}", w.ants.len(), c);
+        assert!(c[1] >= 1, "no nurse: {:?}", c);
+    }
+
+    #[test]
+    fn decay_shortens_corridors_from_the_end_before_touching_rooms() {
+        let mut w = World::new(Config { seed: 19, ants: Some(0), bud: false, drought: false, grow: false, ..Config::default() }, 90, 48);
+        let ex = w.entrances[0];
+        let g = w.ground[ex];
+        // A side corridor off the starter shaft with a dead end.
+        for x in (ex + 1)..(ex + 8) {
+            w.set(x, g + 3, Cell::Tunnel);
+        }
+        w.refresh_fields();
+        w.nests[0].queen = None;
+        w.nests[0].queen_lost = true;
+        for i in 0..w.store.len() {
+            w.store[i] = 0;
+        }
+        let rooms_before = w.chambers();
+        let tip = w.idx(ex + 7, g + 3);
+        let dug_before = w.cells.iter().filter(|c| c.dug()).count();
+        run(&mut w, DECAY_TICKS);
+        // One extremity goes: the corridor's dead end or a protruding room end, never a
+        // cell from the middle of anything.
+        let dug_after = w.cells.iter().filter(|c| c.dug()).count();
+        assert_eq!(dug_after, dug_before - 1);
+        assert!(!w.cells[tip].dug() || w.chambers() == rooms_before - 1, "a middle cell went first:\n{}", w.snapshot());
+        for x in (ex + 1)..(ex + 7) {
+            assert!(w.is_dug(x, g + 3) || !w.is_dug(x + 1, g + 3), "corridor split at {x}:\n{}", w.snapshot());
+        }
+        run(&mut w, DECAY_TICKS * 14);
+        assert!(!w.is_dug(ex + 1, g + 3), "corridor should be eaten from the end back to the shaft:\n{}", w.snapshot());
+    }
+
+    #[test]
+    fn a_nest_whose_room_swallowed_its_shaft_can_still_dig_out() {
+        let mut w = World::new(Config { seed: 20, ants: Some(0), bud: false, drought: false, grow: false, ..Config::default() }, 90, 48);
+        // Build the sealed shape by hand: a two-cell shaft straight into a room.
+        let x = 70;
+        let g = w.ground[x];
+        w.set(x, g, Cell::Tunnel);
+        w.set(x, g + 1, Cell::Tunnel);
+        w.carve_chamber(x, g + 3, 2, 1);
+        w.entrances.push(x);
+        w.refresh_fields();
+        w.tend_queens();
+        let n = w.nests.iter().position(|nst| nst.entrances.contains(&x)).unwrap();
+        let cells = w.nest_cells(n);
+        for _ in 0..6 {
+            w.spawn_ant(n, None);
+            let a = w.ants.last_mut().unwrap();
+            a.job = Job::Digger;
+            a.state = State::ToTip;
+        }
+        w.recount_workers();
+        fill_nest(&mut w, n);
+        for _ in 0..3000 {
+            w.tick();
+            if w.tick.is_multiple_of(50) {
+                fill_nest(&mut w, n);
+            }
+        }
+        assert!(w.nest_cells(n) > cells + 10, "sealed nest never dug out: {} -> {}\n{}", cells, w.nest_cells(n), w.snapshot());
+    }
+
+    #[test]
     fn tiny_and_odd_sizes_do_not_panic() {
         for (cw, ch) in [(1, 1), (8, 6), (9, 7), (71, 48), (200, 12), (30, 200)] {
             let mut w = World::new(Config::default(), cw, ch);
@@ -3101,5 +3222,6 @@ mod tests {
         assert!(w.reports[0].ended > w.reports[0].started);
     }
 }
+
 
 
