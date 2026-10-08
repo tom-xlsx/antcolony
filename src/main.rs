@@ -16,6 +16,9 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Terminal;
 
 use sim::{Config, World};
@@ -74,6 +77,8 @@ fn parse_size(s: &str) -> Result<(usize, usize), String> {
 /// Ticks per frame at each speed level (index = level - 1). Level 1 also halves the frame rate.
 const SPEEDS: [u32; 8] = [1, 1, 2, 3, 4, 6, 8, 12];
 const FRAME: Duration = Duration::from_millis(40);
+/// How long the post-drought notice stays up.
+const NOTICE: Duration = Duration::from_secs(8);
 
 type Term = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
@@ -125,7 +130,7 @@ fn main() -> io::Result<()> {
                     None => "not rebuilt before the next dry spell".to_string(),
                 };
                 println!(
-                    "drought at day {} for {} days: nests {} -> {}, ants {} -> {}, stored {} -> {}, {rebuilt}",
+                    "drought at day {} for {} days: nests {} -> {}, ants {} -> {}, stored {} -> {}, lost {} ants {} queens, {rebuilt}",
                     r.started / sim::DAY,
                     (r.ended - r.started) / sim::DAY,
                     r.nests_before,
@@ -134,6 +139,8 @@ fn main() -> io::Result<()> {
                     r.ants_after,
                     r.stored_before,
                     r.stored_after,
+                    r.ants_lost,
+                    r.queens_lost,
                 );
             }
         }
@@ -160,6 +167,10 @@ struct App {
     speed: u8,
     paused: bool,
     show_status: bool,
+    /// Drought reports already announced.
+    reports_seen: usize,
+    /// The notice on screen and when it went up.
+    notice: Option<(Vec<String>, Instant)>,
 }
 
 impl App {
@@ -212,7 +223,46 @@ impl App {
 
     fn rebuild(&mut self, cols: u16, rows: u16) {
         self.world = World::new(self.cfg.clone(), cols as usize, rows as usize * 2);
+        self.reports_seen = 0;
+        self.notice = None;
     }
+
+    /// When a drought has just ended, put up a little box with the toll.
+    fn check_notice(&mut self) {
+        if self.world.reports.len() <= self.reports_seen {
+            return;
+        }
+        self.reports_seen = self.world.reports.len();
+        let r = self.world.reports.last().unwrap();
+        let days = (r.ended - r.started) / sim::DAY;
+        let plural = |n: u64, one: &str, many: &str| if n == 1 { format!("{n} {one}") } else { format!("{n} {many}") };
+        let mut lines = vec![format!("Drought over after {}", plural(days, "day", "days"))];
+        lines.push(format!("{} and {} lost", plural(r.ants_lost, "ant", "ants"), plural(r.queens_lost, "queen", "queens")));
+        if r.nests_after < r.nests_before {
+            lines.push(format!("{} of {} nests survived", r.nests_after, r.nests_before));
+        }
+        self.notice = Some((lines, Instant::now()));
+    }
+}
+
+/// The notice box, centred near the top of the pane.
+fn draw_notice(frame: &mut ratatui::Frame, lines: &[String]) {
+    let area = frame.area();
+    let width = (lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 4).min(area.width);
+    let height = lines.len() as u16 + 2;
+    if area.height < height + 2 || area.width < width {
+        return;
+    }
+    let rect = Rect::new(area.x + (area.width - width) / 2, area.y + 1, width, height);
+    let style = Style::default()
+        .fg(ratatui::style::Color::Rgb(230, 220, 200))
+        .bg(ratatui::style::Color::Rgb(40, 30, 22));
+    frame.render_widget(Clear, rect);
+    let text: Vec<ratatui::text::Line> = lines.iter().map(|l| ratatui::text::Line::from(l.as_str())).collect();
+    frame.render_widget(
+        Paragraph::new(text).style(style).centered().block(Block::bordered().style(style)),
+        rect,
+    );
 }
 
 fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Result<()> {
@@ -223,6 +273,8 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
         speed,
         paused: false,
         show_status,
+        reports_seen: 0,
+        notice: None,
     };
     let mut next_frame = Instant::now();
 
@@ -233,10 +285,17 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
                 for _ in 0..SPEEDS[app.speed as usize - 1] {
                     app.world.tick();
                 }
+                app.check_notice();
+            }
+            if app.notice.as_ref().is_some_and(|(_, since)| since.elapsed() > NOTICE) {
+                app.notice = None;
             }
             terminal.draw(|frame| {
                 let status = app.status(frame.area().width as usize);
                 frame.render_widget(ui::Colony { world: &app.world, status }, frame.area());
+                if let Some((lines, _)) = &app.notice {
+                    draw_notice(frame, lines);
+                }
             })?;
             next_frame = now + if app.speed == 1 { FRAME * 2 } else { FRAME };
         }

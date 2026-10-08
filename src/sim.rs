@@ -242,6 +242,9 @@ pub struct DroughtReport {
     /// Days after the drought until stores were back to `stored_before`; `None` if the
     /// next dry spell came first.
     pub rebuilt_days: Option<u64>,
+    /// Ants and queens lost since the previous drought ended.
+    pub ants_lost: u64,
+    pub queens_lost: u64,
 }
 
 pub struct World {
@@ -278,6 +281,11 @@ pub struct World {
     pub delivered: u64,
     pub dug: usize,
     pub deaths: u64,
+    pub queen_deaths: u64,
+    /// Deaths and queen deaths as they stood when the previous drought ended.
+    losses_at_last_drought: (u64, u64),
+    /// Cells too close to a decaying nest to dig in until it has crumbled away.
+    husk_zone: Vec<bool>,
     /// Last tick any nest had a living queen.
     last_queen_seen: u64,
     next_label: u8,
@@ -377,6 +385,8 @@ const REFOUND_AFTER: u64 = 50 * DAY;
 /// A nest that has lost its queen fills back in from its extremities, one cell this often,
 /// so the ground is free for whoever comes next.
 const DECAY_TICKS: u64 = 30;
+/// Nobody digs or founds within this many cells of a decaying nest until it is gone.
+const HUSK_GAP: usize = 5;
 const HATCH_TIME: u64 = 600;
 const QUEEN_TICKS: u8 = 10;
 const SETTLE_TIME: u64 = 500;
@@ -446,6 +456,9 @@ impl World {
             delivered: 0,
             dug: 0,
             deaths: 0,
+            queen_deaths: 0,
+            losses_at_last_drought: (0, 0),
+            husk_zone: vec![false; n],
             last_queen_seen: 0,
             next_label: 0,
             drought_before: (0, 0, 0),
@@ -1018,7 +1031,7 @@ impl World {
             if y == self.ground[x] {
                 self.entrances.retain(|&e| e != x);
             }
-            self.dirty = true;
+            self.dirty = true; // also recomputes the keep-out zone
         }
     }
 
@@ -1028,7 +1041,7 @@ impl World {
         let mut x = None;
         for _ in 0..40 {
             let c = 4 + self.rng.usize(..self.w.saturating_sub(8).max(1));
-            if self.entrances.iter().all(|&e| e.abs_diff(c) >= 6) && self.ground[c] + 8 < self.h {
+            if self.entrances.iter().all(|&e| e.abs_diff(c) >= 6) && self.ground[c] + 8 < self.h && !self.husk_zone[self.idx(c, self.ground[c])] {
                 x = Some(c);
                 break;
             }
@@ -1778,6 +1791,7 @@ impl World {
             if q.fed <= 0.0 {
                 let (x, y) = (q.x, q.y);
                 self.corpses.push(Corpse { x, y, queen: true, ttl: QUEEN_CORPSE_DECAY, max_ttl: QUEEN_CORPSE_DECAY });
+                self.queen_deaths += 1;
                 self.nests[n].queen = None;
                 self.nests[n].queen_lost = true;
                 self.nests[n].royal = None;
@@ -2021,6 +2035,7 @@ impl World {
                 }
                 let i = self.idx(x, y);
                 match self.cell(x, y) {
+                    Cell::Soil if self.husk_zone[i] => return None,
                     Cell::Soil => {
                         cells.push(i);
                         all.push(i);
@@ -2117,7 +2132,7 @@ impl World {
             return false;
         }
         let (nx, ny) = (nx as usize, ny as usize);
-        if ny < self.ground[nx] || self.cell(nx, ny) != Cell::Soil {
+        if ny < self.ground[nx] || self.cell(nx, ny) != Cell::Soil || self.husk_zone[self.idx(nx, ny)] {
             return false;
         }
         let going_down = ny > fy;
@@ -2197,6 +2212,9 @@ impl World {
                 if y <= self.ground[x] + 1 {
                     continue;
                 }
+                if self.husk_zone[self.idx(x, y)] && self.cell(x, y) == Cell::Soil {
+                    return; // too close to a decaying nest
+                }
                 cells.push((x, y));
             }
         }
@@ -2263,6 +2281,7 @@ impl World {
     fn refresh_fields(&mut self) {
         if self.dirty {
             self.label_nests();
+            self.mark_husk_zone();
         }
         self.dirty = false;
         self.queens_moved = false;
@@ -2319,6 +2338,30 @@ impl World {
 
         let queens: Vec<usize> = self.nests.iter().filter_map(|nst| nst.queen.as_ref().map(|q| self.idx(q.x, q.y))).collect();
         self.queen_dist = self.bfs(&queens);
+    }
+
+    /// Cells within `HUSK_GAP` of any decaying nest: off limits to new digging and founding
+    /// until the husk has crumbled away.
+    fn mark_husk_zone(&mut self) {
+        self.husk_zone.fill(false);
+        let decaying: Vec<bool> = self
+            .nests
+            .iter()
+            .map(|nst| nst.dead || (nst.queen_lost && nst.queen.is_none()))
+            .collect();
+        for i in 0..self.cells.len() {
+            let n = self.nest_of[i];
+            let husk = self.cells[i].dug() && (n == NO_NEST || decaying[n as usize]);
+            if !husk {
+                continue;
+            }
+            let (x, y) = (i % self.w, i / self.w);
+            for yy in y.saturating_sub(HUSK_GAP)..=(y + HUSK_GAP).min(self.h - 1) {
+                for xx in x.saturating_sub(HUSK_GAP)..=(x + HUSK_GAP).min(self.w - 1) {
+                    self.husk_zone[yy * self.w + xx] = true;
+                }
+            }
+        }
     }
 
     /// Group dug cells into connected systems and match them to nests. A nest keeps its
@@ -2387,13 +2430,16 @@ impl World {
                     // One queen per nest: the older nest's stays, the other's is lost.
                     match (&base.queen, &other.queen) {
                         (None, Some(q)) if !base.queen_lost => base.queen = Some(q.clone()),
-                        (Some(_), Some(q)) => self.corpses.push(Corpse {
-                            x: q.x,
-                            y: q.y,
-                            queen: true,
-                            ttl: QUEEN_CORPSE_DECAY,
-                            max_ttl: QUEEN_CORPSE_DECAY,
-                        }),
+                        (Some(_), Some(q)) => {
+                            self.corpses.push(Corpse {
+                                x: q.x,
+                                y: q.y,
+                                queen: true,
+                                ttl: QUEEN_CORPSE_DECAY,
+                                max_ttl: QUEEN_CORPSE_DECAY,
+                            });
+                            self.queen_deaths += 1;
+                        }
                         _ => {}
                     }
                     if base.royal.is_none() {
@@ -2480,6 +2526,7 @@ impl World {
                 nest.royal = None;
                 if let Some(q) = nest.queen.take() {
                     self.corpses.push(Corpse { x: q.x, y: q.y, queen: true, ttl: QUEEN_CORPSE_DECAY, max_ttl: QUEEN_CORPSE_DECAY });
+                    self.queen_deaths += 1;
                 }
                 self.dirty = true;
             }
@@ -2564,7 +2611,10 @@ impl World {
                     stored_before: self.drought_before.2,
                     stored_after: self.stored(),
                     rebuilt_days: None,
+                    ants_lost: self.deaths - self.losses_at_last_drought.0,
+                    queens_lost: self.queen_deaths - self.losses_at_last_drought.1,
                 });
+                self.losses_at_last_drought = (self.deaths, self.queen_deaths);
                 self.rebuilding = Some((self.reports.len() - 1, self.drought_before.2));
                 Season::Bloom { until: t + BLOOM_LENGTH }
             }
@@ -2604,11 +2654,9 @@ impl World {
         let mut target = None;
         for _ in 0..30 {
             let x = 4 + self.rng.usize(..self.w.saturating_sub(8).max(1));
-            // Keep well clear of living nests; husks only need a little room.
-            let clear = self.entrances.iter().all(|&e| {
-                let gap = if self.is_live_entrance(e) { NEST_GAP } else { 4 };
-                e.abs_diff(x) >= gap
-            });
+            // Keep well clear of living nests, and out of a decaying nest's ground entirely.
+            let clear = self.entrances.iter().all(|&e| !self.is_live_entrance(e) || e.abs_diff(x) >= NEST_GAP)
+                && !self.husk_zone[self.idx(x, self.ground[x])];
             if clear && self.food.iter().all(|f| f.x.abs_diff(x) > 4) {
                 target = Some(x);
                 break;
@@ -3351,7 +3399,12 @@ mod tests {
         w.food.clear();
         w.cfg.food_piles = 0;
         w.season = Season::Drought { until: w.tick + 500 * DAY, started: w.tick };
-        run(&mut w, 4000);
+        for _ in 0..4000 {
+            w.tick();
+            if w.ants.is_empty() && w.nests.iter().all(|n| n.dead) {
+                break;
+            }
+        }
         assert!(w.ants.is_empty() && w.nests.iter().all(|n| n.dead), "{}", w.stats());
         w.season = Season::Calm { until: u64::MAX };
         let x = 60; // beside the husk (the starter nest sits at column 45)
@@ -3362,11 +3415,27 @@ mod tests {
             w.spawn_ant(n, None);
         }
         w.recount_workers();
+        let husk: Vec<(usize, usize)> = (0..w.cells.len())
+            .filter(|&i| w.cells[i].dug() && w.nest_of[i] as usize != n)
+            .map(|i| (i % w.w, i / w.w))
+            .collect();
+        assert!(!husk.is_empty());
+        let near_husk = |x: usize, y: usize| husk.iter().any(|&(hx, hy)| hx.abs_diff(x) <= HUSK_GAP && hy.abs_diff(y) <= HUSK_GAP);
         for _ in 0..60 {
             run(&mut w, 100);
             // Nest A's tunnels only ever crumble; nobody tunnels in and brings it back.
             assert!(!w.nests.iter().any(|nst| nst.label == 'A' && !nst.dead), "husk A came back to life");
             assert!(w.nests.iter().filter(|nst| !nst.dead).all(|nst| nst.label == label));
+            // And while any of it stands, nobody digs near it.
+            let standing = husk.iter().any(|&(hx, hy)| w.is_dug(hx, hy));
+            if standing {
+                for i in 0..w.cells.len() {
+                    if w.cells[i].dug() && w.nest_of[i] as usize == w.nests.iter().position(|nst| nst.label == label).unwrap() {
+                        let (x, y) = (i % w.w, i / w.w);
+                        assert!(!near_husk(x, y) || x == 60 || x.abs_diff(60) <= 2 && y <= w.ground[60] + 6, "dug at {x},{y} within {HUSK_GAP} of the husk:\n{}", w.snapshot());
+                    }
+                }
+            }
         }
     }
 
@@ -3421,11 +3490,13 @@ mod tests {
     }
 
     #[test]
-    fn seasons_cycle_and_report() {
+    fn seasons_cycle_and_report_the_losses() {
         let mut w = World::new(Config { seed: 5, ..Config::default() }, 71, 48);
         run(&mut w, GRACE_PERIOD + WARNING_LENGTH + MAX_DURATION + BLOOM_LENGTH + 1);
         assert_eq!(w.reports.len(), 1, "season is {:?}", w.season);
-        assert!(w.reports[0].ended > w.reports[0].started);
+        let r = &w.reports[0];
+        assert!(r.ended > r.started);
+        assert!(r.ants_lost <= w.deaths && r.queens_lost <= w.queen_deaths);
     }
 }
 

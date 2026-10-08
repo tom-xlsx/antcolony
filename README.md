@@ -43,8 +43,8 @@ hundred ticks later. That is the only way the world gains ants. If she
 dies the nest is doomed: no more eggs, and once the rooms are eaten bare the workers walk off
 to join the nearest nest that still has a queen. Her corpse lies in the chamber for a while.
 A queenless nest crumbles slowly back into soil from its tips inward, entrance last, so the
-ground is free for whoever comes next; living nests leave the husk alone rather than tunnel
-into it. If the whole farm goes queenless for fifty days, a
+ground is free for whoever comes next; living nests keep well clear of a decaying nest and
+only dig into that ground once it has gone. If the whole farm goes queenless for fifty days, a
 founding queen flies in from outside, digs a short shaft and lays from her own reserve until
 she has a few workers.
 
@@ -87,7 +87,8 @@ old chamber keeps its outline; she moves at most twice, and the nest keeps diggi
 When her line dies the outlines fade away with the nest.
 
 The status line shows the jobs as `f66 n12 d30 s12`, the egg count, and nest flags such as
-`1 queenless`, `1 digging royal`, `1 moving`.
+`1 queenless`, `1 preparing a hall`, `1 moving`. When a drought ends a small box reports how
+long it lasted and how many ants and queens were lost since the last one; it closes by itself.
 
 ## Install
 
