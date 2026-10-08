@@ -86,6 +86,10 @@ pub enum State {
     Idle,
     /// Hungry and nobody came: walking to a room with food in it.
     GoEat,
+    /// A nurse on her way to the nearest larder for the queen.
+    Fetch,
+    /// A nurse carrying a unit back to the queen.
+    Deliver,
     /// Out of food in the body. Wandering off to die.
     Starving,
 }
@@ -259,12 +263,16 @@ pub struct World {
     pub nests: Vec<Nest>,
     /// Nest index per cell, `NO_NEST` for soil and sky.
     pub nest_of: Vec<u16>,
+    /// How busy each tunnel cell has been lately; idle diggers widen the busiest.
+    pub traffic: Vec<u16>,
     pub season: Season,
     pub reports: Vec<DroughtReport>,
     pub tick: u64,
     pub delivered: u64,
     pub dug: usize,
     pub deaths: u64,
+    /// Last tick any nest had a living queen.
+    last_queen_seen: u64,
     next_label: u8,
     drought_before: (usize, usize, u32),
     /// (report index, store level to reach) while a rebuild is being timed.
@@ -277,6 +285,8 @@ pub struct World {
     royal_dist: Vec<u16>,
     queen_dist: Vec<u16>,
     dead_tip: Vec<bool>,
+    /// Cells opened to widen a corridor: never tips, never widened again.
+    widened: Vec<bool>,
     dirty: bool,
     queens_moved: bool,
     food_respawn: u32,
@@ -330,8 +340,19 @@ const STARVE_WANDER: u16 = 40;
 const STARVE_TTL: u16 = 150;
 const CORPSE_DECAY: u32 = 900;
 const QUEEN_CORPSE_DECAY: u32 = 1500;
-/// Food units one nurse can carry to the queen or a hungry digger per tick.
+/// Food units one nurse can hand to a hungry digger per tick (the queen is fed by hand).
 const NURSE_FEED: f32 = 0.01;
+/// Nurses fetching for the queen at once.
+const QUEEN_FETCHERS: usize = 3;
+/// Nurses keep at least this much food in the rooms within `QUEEN_PANTRY` cells of the queen.
+const QUEEN_PANTRY_FOOD: u32 = 30;
+const QUEEN_PANTRY: usize = 3;
+/// Traffic (recent passes, halved every `TRAFFIC_HALF_LIFE` ticks) above which an idle
+/// digger will widen a corridor cell to two wide.
+const WIDEN_TRAFFIC: u16 = 30;
+const TRAFFIC_HALF_LIFE: u64 = 200;
+/// Dead-tip marks expire so a boxed-in spot gets another look once things have changed.
+const DEAD_TIP_TTL: u64 = 3000;
 
 // The queen. She carries a far bigger reserve than a worker: a founding queen lives off
 // it for weeks, and in a drought it is what lets the workers starve before she does.
@@ -341,6 +362,10 @@ const LAY_THRESHOLD: f32 = 100.0;
 /// She also skips the lay unless the larder would feed the nest this many drought-days:
 /// the colony stockpiles before it grows.
 const LAY_MIN_DAYS: f32 = 12.0;
+/// A queen with fewer workers than this lays from her own reserve, larder or not.
+const FOUNDING_WORKERS: usize = 3;
+/// With no queen anywhere for this long, a new founding queen arrives from outside.
+const REFOUND_AFTER: u64 = 50 * DAY;
 const HATCH_TIME: u64 = 600;
 const QUEEN_TICKS: u8 = 10;
 const SETTLE_TIME: u64 = 500;
@@ -398,12 +423,14 @@ impl World {
             surf_ph: vec![0.0; w],
             nests: Vec::new(),
             nest_of: vec![NO_NEST; n],
+            traffic: vec![0; n],
             season: Season::Calm { until: GRACE_PERIOD },
             reports: Vec::new(),
             tick: 0,
             delivered: 0,
             dug: 0,
             deaths: 0,
+            last_queen_seen: 0,
             next_label: 0,
             drought_before: (0, 0, 0),
             rebuilding: None,
@@ -415,6 +442,7 @@ impl World {
             royal_dist: vec![FAR; n],
             queen_dist: vec![FAR; n],
             dead_tip: vec![false; n],
+            widened: vec![false; n],
             dirty: true,
             queens_moved: true,
             food_respawn: 0,
@@ -512,6 +540,7 @@ impl World {
     fn doomed(&self, n: usize) -> bool {
         self.nests.get(n).is_some_and(|nest| !nest.dead && nest.queen.is_none() && nest.queen_lost)
             && !self.eggs.iter().any(|e| e.nest == n)
+            && self.nest_food(n) == 0 // they eat the larder down first, then go
     }
 
     /// The nearest living nest with a queen, by entrance, for an orphan at column `x`.
@@ -553,6 +582,40 @@ impl World {
 
     fn nest_cells(&self, n: usize) -> usize {
         self.nest_of.iter().filter(|&&o| o as usize == n).count()
+    }
+
+    /// Take one unit from the room cell `i`. False if it is empty.
+    fn take_here(&mut self, i: usize) -> bool {
+        if !self.cells[i].room() || self.store[i] == 0 {
+            return false;
+        }
+        if self.store[i] >= STORE_CAP || self.store[i] == 1 {
+            self.dirty = true;
+        }
+        self.store[i] -= 1;
+        true
+    }
+
+    /// Food in the rooms around the queen of nest `n`.
+    fn queen_pantry(&self, n: usize) -> u32 {
+        let Some(q) = self.nests[n].queen.as_ref() else { return 0 };
+        let mut sum = 0;
+        for y in q.y.saturating_sub(QUEEN_PANTRY)..=(q.y + QUEEN_PANTRY).min(self.h - 1) {
+            for x in q.x.saturating_sub(QUEEN_PANTRY)..=(q.x + QUEEN_PANTRY).min(self.w - 1) {
+                let i = self.idx(x, y);
+                if self.cells[i].room() {
+                    sum += self.store[i] as u32;
+                }
+            }
+        }
+        sum
+    }
+
+    fn near_queen(&self, n: usize, i: usize) -> bool {
+        self.nests[n]
+            .queen
+            .as_ref()
+            .is_some_and(|q| (i % self.w).abs_diff(q.x) <= QUEEN_PANTRY && (i / self.w).abs_diff(q.y) <= QUEEN_PANTRY)
     }
 
     /// Take food out of a nest, fullest rooms first. False if it did not have enough.
@@ -807,6 +870,15 @@ impl World {
             self.step_ant(i);
         }
         self.bury_the_dead();
+        if self.tick.is_multiple_of(TRAFFIC_HALF_LIFE) {
+            for t in &mut self.traffic {
+                *t /= 2;
+            }
+        }
+        if self.tick.is_multiple_of(DEAD_TIP_TTL) {
+            self.dead_tip.fill(false);
+            self.dirty = true;
+        }
         if self.dirty || self.queens_moved {
             self.refresh_fields();
         }
@@ -848,6 +920,36 @@ impl World {
         if self.cfg.bud && self.cfg.grow && self.tick.is_multiple_of(BUD_EVERY) {
             self.maybe_bud();
         }
+        if self.nests.iter().any(|n| !n.dead && n.queen.is_some()) {
+            self.last_queen_seen = self.tick;
+        } else if self.cfg.grow && self.tick - self.last_queen_seen > REFOUND_AFTER {
+            self.refound();
+        }
+    }
+
+    /// The farm has gone quiet: a founding queen lands and digs in somewhere clear.
+    fn refound(&mut self) {
+        self.last_queen_seen = self.tick;
+        let mut x = None;
+        for _ in 0..40 {
+            let c = 4 + self.rng.usize(..self.w.saturating_sub(8).max(1));
+            if self.entrances.iter().all(|&e| e.abs_diff(c) >= 6) && self.ground[c] + 8 < self.h {
+                x = Some(c);
+                break;
+            }
+        }
+        let Some(x) = x else { return };
+        let g = self.ground[x];
+        for d in 0..5 {
+            if self.cell(x, g + d) == Cell::Soil {
+                self.dug += 1;
+            }
+            self.set(x, g + d, Cell::Tunnel);
+        }
+        self.carve_chamber(x, g + 5, 2, 1);
+        self.entrances.push(x);
+        self.refresh_fields();
+        self.tend_queens();
     }
 
     // ---- ants -------------------------------------------------------------------------
@@ -1027,6 +1129,9 @@ impl World {
     fn step_underground(&mut self, mut ant: Ant) -> Ant {
         ant.cooldown = MOVE_TICKS;
         let here = self.idx(ant.x, ant.y);
+        if self.cells[here] == Cell::Tunnel {
+            self.traffic[here] = self.traffic[here].saturating_add(1);
+        }
         match ant.state {
             State::Foraging | State::Founding(_) => {
                 if ant.hungry() && self.eat_dist[here] != FAR && !matches!(ant.state, State::Founding(_)) {
@@ -1108,10 +1213,13 @@ impl World {
                     ant.dig_dir = self.pick_dig_dir(ant.dig_dir);
                 }
                 if !done {
-                    // Boxed in. Mark this tip dead and go do something else.
-                    self.dead_tip[here] = true;
-                    self.dirty = true;
-                    self.assign(&mut ant, here);
+                    // Boxed in. A real tip is marked dead for a while; either way back off.
+                    if self.dug_neighbours(here) <= 1 {
+                        self.dead_tip[here] = true;
+                        self.dirty = true;
+                    }
+                    ant.state = State::Idle;
+                    ant.idle = 100;
                 }
             }
             State::DigRoyal => {
@@ -1152,8 +1260,7 @@ impl World {
             }
             State::GoEat => {
                 if self.eat_dist[here] == 0 && self.store[here] > 0 {
-                    let n = self.nest_of[here];
-                    if n != NO_NEST && self.take_food(n as usize, 1) {
+                    if self.take_here(here) {
                         ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX);
                         ant.hungry_for = 0;
                     }
@@ -1165,18 +1272,110 @@ impl World {
                     ant.y = ny;
                 }
             }
+            State::Fetch => {
+                if self.eat_dist[here] == 0 && self.store[here] > 0 {
+                    let queen_low = self.nests[ant.home].queen.as_ref().is_some_and(|q| q.fed < QUEEN_FED_MAX - FOOD_VALUE);
+                    if !queen_low && self.near_queen(ant.home, here) {
+                        // Only stocking the pantry, and this already is the pantry.
+                        self.assign(&mut ant, here);
+                    } else if self.take_here(here) {
+                        ant.carrying = true;
+                        ant.state = State::Deliver;
+                    } else {
+                        self.assign(&mut ant, here);
+                    }
+                } else if self.eat_dist[here] == FAR {
+                    self.assign(&mut ant, here); // nothing left anywhere
+                } else if let Some((nx, ny)) = self.descend(Field::Eat, ant.x, ant.y) {
+                    ant.x = nx;
+                    ant.y = ny;
+                }
+            }
+            State::Deliver => {
+                let queen_low = self.nests[ant.home].queen.as_ref().is_some_and(|q| q.fed < QUEEN_FED_MAX - FOOD_VALUE);
+                let pantry_cell = |w: &Self, i: usize| w.near_queen(ant.home, i) && w.cells[i].room() && w.store[i] < STORE_CAP;
+                if !queen_low && pantry_cell(self, here) {
+                    self.store[here] += 1; // into the pantry beside her
+                    self.dirty = true;
+                    ant.carrying = false;
+                    self.assign(&mut ant, here);
+                } else if self.queen_dist[here] <= 1 {
+                    if queen_low {
+                        if let Some(q) = self.nests[ant.home].queen.as_mut() {
+                            q.fed = (q.fed + FOOD_VALUE).min(QUEEN_FED_MAX);
+                        }
+                        ant.carrying = false;
+                        self.assign(&mut ant, here);
+                    } else {
+                        // Standing in the doorway: step into the hall to put it down.
+                        let spot = [(1, 0), (-1, 0), (0, 1), (0, -1)].into_iter().find_map(|(dx, dy)| {
+                            let (nx, ny) = (ant.x as i32 + dx, ant.y as i32 + dy);
+                            if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
+                                return None;
+                            }
+                            let j = self.idx(nx as usize, ny as usize);
+                            pantry_cell(self, j).then_some((nx as usize, ny as usize))
+                        });
+                        if let Some((nx, ny)) = spot {
+                            ant.x = nx;
+                            ant.y = ny;
+                        } else {
+                            // No room to put it: she can take a top-up after all.
+                            if let Some(q) = self.nests[ant.home].queen.as_mut() {
+                                q.fed = (q.fed + FOOD_VALUE).min(QUEEN_FED_MAX);
+                            }
+                            ant.carrying = false;
+                            self.assign(&mut ant, here);
+                        }
+                    }
+                } else if self.queen_dist[here] == FAR {
+                    // No queen to bring it to: eat it or put it down.
+                    if ant.hungry() {
+                        ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX);
+                    } else if self.cells[here].room() && self.store[here] < STORE_CAP {
+                        self.store[here] += 1;
+                        self.dirty = true;
+                    }
+                    ant.carrying = false;
+                    self.assign(&mut ant, here);
+                } else if let Some((nx, ny)) = self.descend(Field::Queen, ant.x, ant.y) {
+                    ant.x = nx;
+                    ant.y = ny;
+                }
+            }
             State::Idle => {
                 if ant.idle == 0 {
                     self.assign(&mut ant, here);
                     return ant;
                 }
                 ant.idle -= 1;
+                if ant.job == Job::Digger && self.rng.f32() < 0.1 {
+                    if let Some(c) = self.widen_spot(here) {
+                        self.cells[c] = Cell::Tunnel;
+                        self.widened[c] = true;
+                        self.dug += 1;
+                        self.dirty = true;
+                        ant.cooldown = DIG_TICKS;
+                        return ant;
+                    }
+                }
                 if ant.job == Job::Nurse {
-                    // Nurses eat from the larder they stand in, and keep near the queen.
-                    if ant.hungry() && self.cells[here].room() && self.store[here] > 0 {
-                        let n = self.nest_of[here];
-                        if n != NO_NEST && self.take_food(n as usize, 1) {
-                            ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX);
+                    // Nurses eat from the larder they stand in, fetch for the queen when
+                    // she is getting low, and otherwise keep near her.
+                    if ant.hungry() && self.take_here(here) {
+                        ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX);
+                    }
+                    let queen_low = self.nests[ant.home].queen.as_ref().is_some_and(|q| q.fed < QUEEN_FED_MAX - FOOD_VALUE);
+                    let pantry_low = self.nests[ant.home].queen.is_some() && self.queen_pantry(ant.home) < QUEEN_PANTRY_FOOD;
+                    if (queen_low || pantry_low) && !ant.hungry() && self.eat_dist[here] != FAR {
+                        let fetching = self
+                            .ants
+                            .iter()
+                            .filter(|a| a.home == ant.home && matches!(a.state, State::Fetch | State::Deliver))
+                            .count();
+                        if fetching < QUEEN_FETCHERS {
+                            ant.state = State::Fetch;
+                            return ant;
                         }
                     }
                     let d = self.queen_dist[here];
@@ -1340,6 +1539,53 @@ impl World {
         }
     }
 
+    /// A soil cell beside a busy corridor cell that an idle digger may open to make the
+    /// corridor two wide. Only corridors (two opposite dug neighbours), only once, and
+    /// never near the surface or another tunnel.
+    fn widen_spot(&mut self, here: usize) -> Option<usize> {
+        if self.cells[here] != Cell::Tunnel || self.traffic[here] < WIDEN_TRAFFIC || self.widened[here] {
+            return None;
+        }
+        let (x, y) = (here % self.w, here / self.w);
+        if x < 2 || y < 2 || x + 2 >= self.w || y + 2 >= self.h || y < self.ground[x] + 3 {
+            return None;
+        }
+        let dug = |w: &Self, dx: i32, dy: i32| w.is_dug((x as i32 + dx) as usize, (y as i32 + dy) as usize);
+        let horizontal = dug(self, 1, 0) && dug(self, -1, 0) && !dug(self, 0, 1) && !dug(self, 0, -1);
+        let vertical = dug(self, 0, 1) && dug(self, 0, -1) && !dug(self, 1, 0) && !dug(self, -1, 0);
+        let sides: [(i32, i32); 2] = if horizontal {
+            [(0, 1), (0, -1)]
+        } else if vertical {
+            [(1, 0), (-1, 0)]
+        } else {
+            return None;
+        };
+        let first = self.rng.bool();
+        for &(dx, dy) in [sides[first as usize], sides[!first as usize]].iter() {
+            let (cx, cy) = ((x as i32 + dx) as usize, (y as i32 + dy) as usize);
+            let c = self.idx(cx, cy);
+            if self.cells[c] != Cell::Soil || self.planned_royal(c) {
+                continue;
+            }
+            // Beyond the corridor, the new cell may only touch other widened cells.
+            let mut clear = true;
+            for (ex, ey) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (nx, ny) = ((cx as i32 + ex) as usize, (cy as i32 + ey) as usize);
+                let j = self.idx(nx, ny);
+                if j == here {
+                    continue;
+                }
+                if self.is_dug(nx, ny) && !self.widened[j] {
+                    clear = false;
+                }
+            }
+            if clear {
+                return Some(c);
+            }
+        }
+        None
+    }
+
     fn adjacent(&self, a: usize, b: usize) -> bool {
         let (ax, ay) = (a % self.w, a / self.w);
         let (bx, by) = (b % self.w, b / self.w);
@@ -1362,14 +1608,8 @@ impl World {
                 .filter(|a| a.home == n && a.job == Job::Nurse && a.state != State::Starving && a.underground)
                 .count();
             self.nests[n].feed_acc = (self.nests[n].feed_acc + nurses as f32 * NURSE_FEED).min(2.0);
-            // The queen eats first.
-            let queen_hungry = self.nests[n].queen.as_ref().is_some_and(|q| q.fed < QUEEN_FED_MAX - FOOD_VALUE);
-            if queen_hungry && self.nests[n].feed_acc >= 1.0 && self.take_food(n, 1) {
-                self.nests[n].feed_acc -= 1.0;
-                let q = self.nests[n].queen.as_mut().unwrap();
-                q.fed = (q.fed + FOOD_VALUE).min(QUEEN_FED_MAX);
-            }
-            // Then the hungriest digger.
+            // The queen is fed by nurses carrying food to her (see `Fetch`/`Deliver`);
+            // this hand-out is for the hungriest digger.
             while self.nests[n].feed_acc >= 1.0 {
                 let hungriest = self
                     .ants
@@ -1443,7 +1683,7 @@ impl World {
                 let nest = &self.nests[n];
                 nest.workers * 2 >= self.nest_cells(n) + 4
             };
-            let stocked = self.nests[n].food_days >= LAY_MIN_DAYS;
+            let stocked = self.nests[n].food_days >= LAY_MIN_DAYS || self.nests[n].workers < FOUNDING_WORKERS;
             let can_lay = self.cfg.grow && self.ants.len() + self.eggs.len() < self.cfg.max_ants && !crowded && stocked;
             let Some(q) = self.nests[n].queen.as_mut() else { continue };
             if q.relocating || self.tick < q.settle_until || self.tick - q.last_lay < LAY_INTERVAL {
@@ -1828,14 +2068,12 @@ impl World {
         let rooms: Vec<usize> = (0..n).filter(|&i| self.cells[i].room()).collect();
         self.room_dist = self.bfs(&rooms);
 
+        let usable = |w: &Self, i: usize| w.cells[i] == Cell::Tunnel && !w.dead_tip[i] && !w.widened[i] && w.nest_alive_at(i);
         let mut tips: Vec<usize> = (0..n)
-            .filter(|&i| self.cells[i] == Cell::Tunnel && !self.dead_tip[i] && self.dug_neighbours(i) <= 1)
-            .filter(|&i| i / self.w > self.ground[i % self.w] && self.nest_alive_at(i))
+            .filter(|&i| usable(self, i) && self.dug_neighbours(i) <= 1 && i / self.w > self.ground[i % self.w])
             .collect();
         if tips.is_empty() {
-            tips = (0..n)
-                .filter(|&i| self.cells[i] == Cell::Tunnel && !self.dead_tip[i] && self.nest_alive_at(i))
-                .collect();
+            tips = (0..n).filter(|&i| usable(self, i)).collect();
         }
         self.tip_dist = self.bfs(&tips);
 
@@ -2001,7 +2239,8 @@ impl World {
         for n in 0..self.nests.len() {
             let nest = &self.nests[n];
             let eggs_left = self.eggs.iter().any(|e| e.nest == n);
-            if nest.workers == 0 && !nest.dead && !eggs_left {
+            // A queen alone in an empty nest is not dead: she lays again once she can.
+            if nest.workers == 0 && !nest.dead && !eggs_left && nest.queen.is_none() {
                 let nest = &mut self.nests[n];
                 nest.dead = true;
                 nest.royal = None;
@@ -2183,7 +2422,7 @@ impl World {
                 } else if let Some(a) = self.ants.iter().find(|a| a.x == x && a.y == y) {
                     match (a.state, a.job) {
                         (State::Starving, _) => 'x',
-                        (State::Returning, _) => 'A',
+                        (State::Returning | State::Deliver, _) => 'A',
                         (State::Founding(_), _) => '*',
                         (_, Job::Forager) => 'f',
                         (_, Job::Nurse) => 'n',
@@ -2547,6 +2786,7 @@ mod tests {
             seen_corpse |= !w.corpses.is_empty();
             seen_partial |= !w.ants.is_empty() && w.deaths > 0;
             if w.ants.is_empty() && w.eggs.is_empty() && w.nests[0].queen.is_none() {
+                run(&mut w, 2); // the nest is declared dead on the next count
                 break;
             }
         }
@@ -2666,6 +2906,87 @@ mod tests {
     }
 
     #[test]
+    fn nurses_fetch_from_the_nearest_larder_for_a_hungry_queen() {
+        let mut w = World::new(Config { seed: 13, ants: Some(12), bud: false, drought: false, ..Config::default() }, 90, 48);
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        fill_nest(&mut w, 0);
+        for a in &mut w.ants {
+            a.job = Job::Nurse;
+            a.state = State::Idle;
+            a.idle = IDLE_TICKS;
+        }
+        let before = w.nests[0].queen.as_ref().unwrap().fed;
+        w.nests[0].queen.as_mut().unwrap().fed = QUEEN_FED_MAX * 0.3;
+        let mut carried = false;
+        for _ in 0..1500 {
+            w.tick();
+            carried |= w.ants.iter().any(|a| a.state == State::Deliver && a.carrying);
+            if w.nests[0].queen.as_ref().unwrap().fed > QUEEN_FED_MAX * 0.6 {
+                break;
+            }
+        }
+        assert!(carried, "no nurse ever carried food to the queen");
+        assert!(w.nests[0].queen.as_ref().unwrap().fed > QUEEN_FED_MAX * 0.5, "queen still hungry (was {before})");
+    }
+
+    #[test]
+    fn an_idle_digger_widens_a_busy_corridor_but_only_to_two() {
+        let mut w = World::new(Config { seed: 14, ants: Some(1), bud: false, drought: false, ..Config::default() }, 71, 48);
+        let ex = w.entrances[0];
+        let g = w.ground[ex];
+        // A long shaft, a digger idling in it, heavy traffic on one cell.
+        for y in g..(g + 20) {
+            w.set(ex, y, Cell::Tunnel);
+        }
+        w.refresh_fields();
+        let y = g + 15; // well below the starter room
+        let here = w.idx(ex, y);
+        w.ants[0] = ant_at(ex, y, Job::Digger, State::Idle, true);
+        w.ants[0].idle = 5000;
+        w.traffic[here] = WIDEN_TRAFFIC + 50;
+        let mut widened = 0;
+        for _ in 0..2000 {
+            w.tick();
+
+            w.ants[0].x = ex;
+            w.ants[0].y = y;
+            w.ants[0].state = State::Idle;
+            w.ants[0].idle = 5000;
+            w.traffic[here] = WIDEN_TRAFFIC + 50;
+            widened = [(ex - 1, y), (ex + 1, y)].iter().filter(|&&(x, yy)| w.is_dug(x, yy)).count();
+        }
+        assert_eq!(widened, 1, "corridor should be exactly two wide:\n{}", w.snapshot());
+    }
+
+    #[test]
+    fn orphans_stay_until_the_larder_is_empty() {
+        let mut w = World::new(Config { seed: 15, ants: Some(8), bud: false, drought: false, ..Config::default() }, 71, 48);
+        fill_nest(&mut w, 0);
+        w.nests[0].queen = None;
+        w.nests[0].queen_lost = true;
+        assert!(!w.doomed(0), "still food in the rooms");
+        for i in 0..w.store.len() {
+            w.store[i] = 0;
+        }
+        assert!(w.doomed(0));
+    }
+
+    #[test]
+    fn a_new_queen_arrives_when_the_farm_has_gone_quiet() {
+        let mut w = World::new(Config { seed: 16, ants: Some(0), bud: false, drought: false, ..Config::default() }, 90, 48);
+        w.nests[0].queen = None;
+        w.nests[0].queen_lost = true;
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        run(&mut w, REFOUND_AFTER + 5);
+        assert!(w.nests.iter().any(|n| !n.dead && n.queen.is_some()), "nobody came:\n{}", w.snapshot());
+        // She lays from her reserve with no workers and no larder.
+        run(&mut w, LAY_INTERVAL + HATCH_TIME + 10);
+        assert!(!w.ants.is_empty(), "the founding queen never hatched a worker");
+    }
+
+    #[test]
     fn tiny_and_odd_sizes_do_not_panic() {
         for (cw, ch) in [(1, 1), (8, 6), (9, 7), (71, 48), (200, 12), (30, 200)] {
             let mut w = World::new(Config::default(), cw, ch);
@@ -2690,3 +3011,5 @@ mod tests {
         assert!(w.reports[0].ended > w.reports[0].started);
     }
 }
+
+

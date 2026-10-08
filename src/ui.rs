@@ -165,7 +165,7 @@ pub fn paint(world: &World) -> Vec<Rgb> {
         if ant.x < w && ant.y < h {
             let base = match (ant.state, ant.job) {
                 (State::Starving, _) => palette::ANT_STARVING,
-                (State::Returning, _) => palette::ANT_CARRYING,
+                (State::Returning | State::Deliver, _) => palette::ANT_CARRYING,
                 (State::Founding(_), _) => palette::ANT_FOUNDING,
                 (_, Job::Forager) => palette::ANT,
                 (_, Job::Digger) => palette::ANT_DIGGING,
