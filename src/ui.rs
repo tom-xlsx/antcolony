@@ -15,6 +15,21 @@ use crate::sim::{Cell, Job, Season, State, World, HUNGRY, NO_NEST};
 pub struct Colony<'a> {
     pub world: &'a World,
     pub status: Option<String>,
+    /// The season whose tint is dissolving out, and how far the dissolve has got (0..1).
+    /// Changing every cell's colour in one frame is a burst the terminal can tear on, so
+    /// the new weather arrives cell by cell instead.
+    pub fading_from: Option<Season>,
+    pub fade: f32,
+}
+
+/// Which tint a season uses; seasons with the same key look identical.
+pub fn weather_key(season: Season) -> u8 {
+    match season {
+        Season::Calm { .. } | Season::Cooldown { .. } => 0,
+        Season::Warning { .. } => 1,
+        Season::Drought { .. } => 2,
+        Season::Bloom { .. } => 3,
+    }
 }
 
 /// Cheap stable per-pixel noise.
@@ -57,16 +72,22 @@ fn weather(season: Season) -> Weather {
 }
 
 /// Flat RGB pixel buffer the size of the world.
-pub fn paint(world: &World) -> Vec<Rgb> {
+pub fn paint(world: &World, fading_from: Option<Season>, fade: f32) -> Vec<Rgb> {
     let (w, h) = (world.w, world.h);
-    let wx = weather(world.season);
-    let mut px = vec![wx.sky; w * h];
+    let wx_new = weather(world.season);
+    let wx_old = fading_from.map(weather);
+    let threshold = (fade.clamp(0.0, 1.0) * 1000.0) as u32;
+    let mut px = vec![wx_new.sky; w * h];
     // Sun sits top-right of the sky during a drought.
     let sun = (w as i32 - 6, 3_i32);
 
     for y in 0..h {
         for x in 0..w {
             let n = hash(x, y);
+            let wx = match &wx_old {
+                Some(old) if (n >> 7) % 1000 >= threshold => old,
+                _ => &wx_new,
+            };
             let ground = world.ground[x];
             let c = match world.cell(x, y) {
                 Cell::Sky => {
@@ -212,7 +233,7 @@ impl Widget for Colony<'_> {
             return;
         }
         let world = self.world;
-        let px = paint(world);
+        let px = paint(world, self.fading_from, self.fade);
         let cols = (area.width as usize).min(world.w);
         let rows = (area.height as usize).min(world.h / 2);
         for cy in 0..rows {

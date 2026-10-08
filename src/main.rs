@@ -2,7 +2,7 @@ mod palette;
 mod sim;
 mod ui;
 
-use std::io::{self, stdout, BufWriter, Stdout};
+use std::io::{self, stdout, Write};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -80,14 +80,45 @@ const FRAME: Duration = Duration::from_millis(40);
 /// How long the post-drought notice stays up.
 const NOTICE: Duration = Duration::from_secs(8);
 
-type Term = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+/// Collects a whole frame, then hands it to the terminal in modest chunks with a breath
+/// between them. One huge write (a full repaint is a few hundred kilobytes) can tear on
+/// the way through a multiplexer and the terminal, which shows up as striped rows and
+/// missing letters; paced out, it arrives intact.
+struct Paced {
+    buf: Vec<u8>,
+}
 
-/// Raw mode, alternate screen, mouse reporting, and a 1 MiB write buffer so each frame
-/// reaches the terminal in one write instead of a thousand small ones.
+const CHUNK: usize = 16 * 1024;
+
+impl Write for Paced {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut out = stdout().lock();
+        let big = self.buf.len() > 2 * CHUNK;
+        for chunk in self.buf.chunks(CHUNK) {
+            out.write_all(chunk)?;
+            out.flush()?;
+            if big {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+type Term = Terminal<CrosstermBackend<Paced>>;
+
+/// Raw mode, alternate screen, mouse reporting, and a paced writer so each frame reaches
+/// the terminal whole.
 fn setup_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(BufWriter::with_capacity(1 << 20, stdout()));
+    let backend = CrosstermBackend::new(Paced { buf: Vec::with_capacity(1 << 20) });
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
     // No `terminal.clear()` here: it asks the terminal for the cursor position and bails
@@ -171,7 +202,14 @@ struct App {
     reports_seen: usize,
     /// The notice on screen and when it went up.
     notice: Option<(Vec<String>, Instant)>,
+    /// Season tint currently shown, the one dissolving out, and the dissolve progress.
+    shown_season: sim::Season,
+    fading_from: Option<sim::Season>,
+    fade: f32,
 }
+
+/// Dissolve step per frame: about two seconds for a full change of weather.
+const FADE_STEP: f32 = 0.02;
 
 impl App {
     /// Status line, dropping the least important parts until it fits the pane.
@@ -225,6 +263,25 @@ impl App {
         self.world = World::new(self.cfg.clone(), cols as usize, rows as usize * 2);
         self.reports_seen = 0;
         self.notice = None;
+        self.shown_season = self.world.season;
+        self.fading_from = None;
+        self.fade = 1.0;
+    }
+
+    /// Advance the weather dissolve, starting a new one when the season's tint changes.
+    fn advance_fade(&mut self) {
+        if ui::weather_key(self.world.season) != ui::weather_key(self.shown_season) {
+            self.fading_from = Some(self.shown_season);
+            self.shown_season = self.world.season;
+            self.fade = 0.0;
+        }
+        if self.fading_from.is_some() {
+            self.fade += FADE_STEP;
+            if self.fade >= 1.0 {
+                self.fading_from = None;
+                self.fade = 1.0;
+            }
+        }
     }
 
     /// When a drought has just ended, put up a little box with the toll.
@@ -275,7 +332,11 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
         show_status,
         reports_seen: 0,
         notice: None,
+        shown_season: sim::Season::Calm { until: 0 },
+        fading_from: None,
+        fade: 1.0,
     };
+    app.shown_season = app.world.season;
     let mut next_frame = Instant::now();
 
     loop {
@@ -290,9 +351,13 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
             if app.notice.as_ref().is_some_and(|(_, since)| since.elapsed() > NOTICE) {
                 app.notice = None;
             }
+            app.advance_fade();
             terminal.draw(|frame| {
                 let status = app.status(frame.area().width as usize);
-                frame.render_widget(ui::Colony { world: &app.world, status }, frame.area());
+                frame.render_widget(
+                    ui::Colony { world: &app.world, status, fading_from: app.fading_from, fade: app.fade },
+                    frame.area(),
+                );
                 if let Some((lines, _)) = &app.notice {
                     draw_notice(frame, lines);
                 }
