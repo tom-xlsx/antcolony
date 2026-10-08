@@ -10,7 +10,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
 use crate::palette::{self, Rgb};
-use crate::sim::{Cell, Role, Season, State, World, NO_NEST};
+use crate::sim::{Cell, Job, Season, State, World, HUNGRY, NO_NEST};
 
 pub struct Colony<'a> {
     pub world: &'a World,
@@ -96,20 +96,16 @@ pub fn paint(world: &World) -> Vec<Rgb> {
                         palette::shade(wx.soil, var - depth.min(30))
                     }
                 }
-                Cell::Tunnel | Cell::Chamber => {
+                Cell::Tunnel | Cell::Chamber | Cell::Royal => {
                     let i = y * w + x;
-                    let base = if world.cell(x, y) == Cell::Tunnel {
-                        palette::TUNNEL
-                    } else {
-                        palette::lerp(palette::CHAMBER, palette::FOOD, world.store[i] as f32 / STORE_CAP)
+                    let base = match world.cell(x, y) {
+                        Cell::Tunnel => palette::TUNNEL,
+                        Cell::Royal => palette::lerp(palette::ROYAL, palette::FOOD, world.store[i] as f32 / STORE_CAP),
+                        _ => palette::lerp(palette::CHAMBER, palette::FOOD, world.store[i] as f32 / STORE_CAP),
                     };
                     let nest = world.nest_of[i];
-                    if nest == NO_NEST {
-                        base
-                    } else if world.nests[nest as usize].dead {
+                    if nest != NO_NEST && world.nests[nest as usize].dead {
                         palette::ABANDONED
-                    } else if world.nests[nest as usize].starving {
-                        palette::lerp(base, (0, 0, 0), 0.35)
                     } else {
                         base
                     }
@@ -141,16 +137,58 @@ pub fn paint(world: &World) -> Vec<Rgb> {
         }
     }
 
+    // The planned royal chamber shows through the soil while it is being dug.
+    for nest in &world.nests {
+        if let Some(r) = &nest.royal {
+            for &c in &r.cells {
+                px[c] = palette::ROYAL_PLAN;
+            }
+        }
+    }
+
+    for egg in &world.eggs {
+        px[egg.cell] = palette::EGG;
+    }
+
+    for c in &world.corpses {
+        if c.x < w && c.y < h {
+            let under = px[c.y * w + c.x];
+            let fade = c.ttl as f32 / c.max_ttl as f32;
+            px[c.y * w + c.x] = palette::lerp(under, palette::CORPSE, 0.3 + 0.7 * fade);
+            if c.queen && c.x + 1 < w && world.cell(c.x + 1, c.y).dug() {
+                px[c.y * w + c.x + 1] = palette::lerp(under, palette::CORPSE, 0.3 + 0.7 * fade);
+            }
+        }
+    }
+
     for ant in &world.ants {
         if ant.x < w && ant.y < h {
-            px[ant.y * w + ant.x] = match (ant.state, ant.role) {
+            let base = match (ant.state, ant.job) {
+                (State::Starving, _) => palette::ANT_STARVING,
                 (State::Returning, _) => palette::ANT_CARRYING,
                 (State::Founding(_), _) => palette::ANT_FOUNDING,
-                (_, Role::Forager) => palette::ANT,
-                (_, Role::Digger) => palette::ANT_DIGGING,
-                (_, Role::Scout) => palette::ANT_SCOUT,
-                (_, Role::Nurse) => palette::ANT_NURSE,
+                (_, Job::Forager) => palette::ANT,
+                (_, Job::Digger) => palette::ANT_DIGGING,
+                (_, Job::Scout) => palette::ANT_SCOUT,
+                (_, Job::Nurse) => palette::ANT_NURSE,
             };
+            // Hungry ants go dim.
+            px[ant.y * w + ant.x] = if ant.fed < HUNGRY && ant.state != State::Starving {
+                palette::lerp(base, palette::TUNNEL, 0.45)
+            } else {
+                base
+            };
+        }
+    }
+
+    // The queen is two pixels wide and never dimmed; her second pixel fills a dug cell.
+    for nest in &world.nests {
+        if let Some(q) = &nest.queen {
+            let c = if q.relocating { palette::QUEEN_MOVING } else { palette::QUEEN };
+            px[q.y * w + q.x] = c;
+            if q.x + 1 < w && world.cell(q.x + 1, q.y).dug() {
+                px[q.y * w + q.x + 1] = c;
+            }
         }
     }
     px

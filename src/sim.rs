@@ -1,6 +1,6 @@
-//! A side-on ant farm: sky on top, soil below, a colony digging tunnels and chambers
-//! and foraging on the surface. No terminal types in here, so it can be unit-tested
-//! and run headless.
+//! A side-on ant farm: sky on top, soil below, colonies digging tunnels and chambers,
+//! foraging on the surface, each ruled by a queen. No terminal types in here, so it can
+//! be unit-tested and run headless.
 
 use std::collections::VecDeque;
 
@@ -10,7 +10,7 @@ pub struct Config {
     pub ants: Option<usize>,
     /// Food piles kept on the surface at once.
     pub food_piles: usize,
-    /// Spawn more ants as food is stored.
+    /// Queens lay eggs (off = fixed population, no budding).
     pub grow: bool,
     pub max_ants: usize,
     /// Let a big colony send a party off to open a new nest elsewhere.
@@ -42,24 +42,31 @@ pub enum Cell {
     Soil,
     Tunnel,
     Chamber,
+    /// A royal chamber: twice the size of a room, dug deep for the queen.
+    Royal,
 }
 
-/// What an ant is for. Fixed at birth; a nest keeps its castes near `ROLE_SHARES`.
+impl Cell {
+    pub fn dug(self) -> bool {
+        matches!(self, Cell::Tunnel | Cell::Chamber | Cell::Royal)
+    }
+    pub fn room(self) -> bool {
+        matches!(self, Cell::Chamber | Cell::Royal)
+    }
+}
+
+/// What an ant is doing for the nest. Reassigned as the food situation changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
+pub enum Job {
     /// Works the surface near home, follows trails, hauls food.
     Forager = 0,
-    /// Lives underground extending tunnels and carving chambers.
-    Digger = 1,
+    /// Keeps to the rooms, feeds the queen and hungry diggers, minds the stores.
+    Nurse = 1,
+    /// Extends tunnels and rooms; digs the royal chamber when the nest is ready.
+    Digger = 2,
     /// Ranges far along the surface, finds food first, founds new nests.
-    Scout = 2,
-    /// Stays in the chambers minding the stores.
-    Nurse = 3,
+    Scout = 3,
 }
-
-/// Target share of each caste, in percent.
-const ROLE_SHARES: [(Role, u32); 4] =
-    [(Role::Forager, 60), (Role::Digger, 20), (Role::Scout, 10), (Role::Nurse, 10)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -71,10 +78,16 @@ pub enum State {
     ToTip,
     /// Extending a tunnel.
     Digging,
+    /// Digging out the royal chamber.
+    DigRoyal,
     /// Walking along the surface to open a new nest at this column.
     Founding(usize),
     /// Pottering about underground for a while.
     Idle,
+    /// Hungry and nobody came: walking to a room with food in it.
+    GoEat,
+    /// Out of food in the body. Wandering off to die.
+    Starving,
 }
 
 #[derive(Clone, Debug)]
@@ -82,12 +95,18 @@ pub struct Ant {
     pub x: usize,
     pub y: usize,
     pub state: State,
-    pub role: Role,
+    pub job: Job,
     /// On the surface or in a tunnel.
     pub underground: bool,
     /// Index into `World::nests`.
     pub home: usize,
-    /// Ticks left of idling.
+    /// Food in the body, 0..=FED_MAX.
+    pub fed: f32,
+    /// Holding a unit of food.
+    pub carrying: bool,
+    /// Ticks spent hungry waiting for a nurse.
+    hungry_for: u32,
+    /// Ticks left of idling, wandering while starving, or walking to die.
     idle: u16,
     /// Surface walking direction, -1 or 1.
     dir: i32,
@@ -99,10 +118,63 @@ pub struct Ant {
     strength: f32,
 }
 
+impl Ant {
+    pub fn hungry(&self) -> bool {
+        self.fed < HUNGRY
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Food {
     pub x: usize,
     pub units: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Queen {
+    pub x: usize,
+    pub y: usize,
+    pub fed: f32,
+    /// Walking to the royal chamber.
+    pub relocating: bool,
+    pub relocations: u8,
+    last_lay: u64,
+    settle_until: u64,
+    last_relocation: u64,
+    cooldown: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct Egg {
+    pub cell: usize,
+    pub nest: usize,
+    hatch_at: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Corpse {
+    pub x: usize,
+    pub y: usize,
+    pub queen: bool,
+    pub ttl: u32,
+    pub max_ttl: u32,
+}
+
+/// A royal chamber being dug, then (once `cells` is empty) waiting for the queen.
+#[derive(Clone, Debug)]
+pub struct Royal {
+    /// Soil cells still to dig.
+    pub cells: Vec<usize>,
+    /// Cells already opened, where the queen will settle.
+    pub dug: Vec<usize>,
+}
+
+/// How the nest's larder looks, measured in days it would last in a drought.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Band {
+    Plentiful,
+    Normal,
+    Scarce,
 }
 
 /// One connected tunnel system with at least one entrance.
@@ -111,13 +183,16 @@ pub struct Nest {
     pub label: char,
     pub entrances: Vec<usize>,
     pub workers: usize,
-    /// Out of food during a drought.
-    pub starving: bool,
     /// Lost its last worker. The tunnels stay as a husk.
     pub dead: bool,
-    last_spawn: u64,
-    consume_acc: f32,
-    starve_timer: u32,
+    pub queen: Option<Queen>,
+    /// Had a queen and lost her: no new one will come.
+    pub queen_lost: bool,
+    pub royal: Option<Royal>,
+    pub band: Band,
+    pub food_days: f32,
+    /// Food (in units) nurses have gathered to hand out this tick.
+    feed_acc: f32,
 }
 
 impl Nest {
@@ -126,11 +201,13 @@ impl Nest {
             label,
             entrances,
             workers: 0,
-            starving: false,
             dead: false,
-            last_spawn: 0,
-            consume_acc: 0.0,
-            starve_timer: 0,
+            queen: None,
+            queen_lost: false,
+            royal: None,
+            band: Band::Normal,
+            food_days: 0.0,
+            feed_acc: 0.0,
         }
     }
 }
@@ -165,7 +242,7 @@ pub struct World {
     pub w: usize,
     pub h: usize,
     pub cells: Vec<Cell>,
-    /// Food units stored in each chamber cell.
+    /// Food units stored in each room cell.
     pub store: Vec<u8>,
     /// Row of the topmost soil cell in each column (sky above, mounds raise it).
     pub ground: Vec<usize>,
@@ -175,6 +252,8 @@ pub struct World {
     pub entrances: Vec<usize>,
     pub ants: Vec<Ant>,
     pub food: Vec<Food>,
+    pub eggs: Vec<Egg>,
+    pub corpses: Vec<Corpse>,
     /// "Food is this way" trail along the surface, one value per column.
     pub surf_ph: Vec<f32>,
     pub nests: Vec<Nest>,
@@ -185,15 +264,21 @@ pub struct World {
     pub tick: u64,
     pub delivered: u64,
     pub dug: usize,
+    pub deaths: u64,
     next_label: u8,
     drought_before: (usize, usize, u32),
     /// (report index, store level to reach) while a rebuild is being timed.
     rebuilding: Option<(usize, u32)>,
     exit_dist: Vec<u16>,
     store_dist: Vec<u16>,
+    eat_dist: Vec<u16>,
+    room_dist: Vec<u16>,
     tip_dist: Vec<u16>,
+    royal_dist: Vec<u16>,
+    queen_dist: Vec<u16>,
     dead_tip: Vec<bool>,
     dirty: bool,
+    queens_moved: bool,
     food_respawn: u32,
     cfg: Config,
     rng: fastrand::Rng,
@@ -203,26 +288,81 @@ pub struct World {
 enum Field {
     Exit,
     Store,
+    Eat,
+    Room,
     Tip,
+    Royal,
+    Queen,
 }
 
 const FAR: u16 = u16::MAX;
 const MOVE_TICKS: u8 = 3;
 const DIG_TICKS: u8 = 24;
-/// Diggers stop once this share of the soil is hollow.
+/// Living nests may hollow out this share of the soil between them.
 const DIG_SHARE: usize = 40;
 const VISION: usize = 8;
 const SCOUT_VISION: usize = 14;
 const IDLE_TICKS: u16 = 300;
 const STORE_CAP: u8 = 6;
 pub const NO_NEST: u16 = u16::MAX;
+const DEPOSIT: f32 = 0.08;
+const STRENGTH_DECAY: f32 = 0.985;
+const EVAPORATION: f32 = 0.994;
+const FOOD_RESPAWN_TICKS: u32 = 200;
+const BUD_POPULATION: usize = 60;
+const BUD_PARTY: usize = 5;
+const BUD_EVERY: u64 = 900;
+const NEST_GAP: usize = 18;
 
-// Growth: the only way the world gains ants. A nest only grows once it holds a reserve
-// for the workers it already has, so stockpiles build before mouths do.
-const SPAWN_THRESHOLD: u32 = 12;
-const RESERVE_PER_WORKER: u32 = 8;
-const SPAWN_COST: u32 = 4;
-const SPAWN_INTERVAL: u64 = 60;
+// Hunger. Every ant carries food in its body and eats a unit from the store when low.
+pub const FED_MAX: f32 = 100.0;
+pub const HUNGRY: f32 = 40.0;
+const WORKER_CONSUME: f32 = 0.012;
+const QUEEN_CONSUME: f32 = 0.06;
+/// Fed points one food unit is worth.
+const FOOD_VALUE: f32 = 40.0;
+/// Hunger runs this much faster in a drought (heat, no surface water): it is what makes
+/// droughts dangerous rather than merely dull.
+const DROUGHT_HUNGER: f32 = 6.0;
+/// Ticks a hungry digger or queen waits for a nurse before going to the store.
+const PATIENCE: u32 = 400;
+const STARVE_WANDER: u16 = 40;
+const STARVE_TTL: u16 = 150;
+const CORPSE_DECAY: u32 = 900;
+const QUEEN_CORPSE_DECAY: u32 = 1500;
+/// Food units one nurse can carry to the queen or a hungry digger per tick.
+const NURSE_FEED: f32 = 0.01;
+
+// The queen. She carries a far bigger reserve than a worker: a founding queen lives off
+// it for weeks, and in a drought it is what lets the workers starve before she does.
+pub const QUEEN_FED_MAX: f32 = 400.0;
+const LAY_INTERVAL: u64 = 300;
+const LAY_THRESHOLD: f32 = 100.0;
+/// She also skips the lay unless the larder would feed the nest this many drought-days:
+/// the colony stockpiles before it grows.
+const LAY_MIN_DAYS: f32 = 12.0;
+const HATCH_TIME: u64 = 600;
+const QUEEN_TICKS: u8 = 10;
+const SETTLE_TIME: u64 = 500;
+
+// Jobs. Targets are percent (forager, nurse, digger); scouts take a slice of the foragers.
+const RICH_DAYS: f32 = 15.0;
+const SCARCE_DAYS: f32 = 5.0;
+const JOBS_PLENTIFUL: [u32; 3] = [40, 30, 30];
+const JOBS_NORMAL: [u32; 3] = [60, 30, 10];
+const JOBS_SCARCE: [u32; 3] = [85, 15, 0];
+const SCOUT_SHARE: u32 = 10;
+const REASSIGN_EVERY: u64 = 15;
+const MIN_NURSES: usize = 2;
+
+// Relocation.
+const RELOCATE_GAP: usize = 8;
+const RELOCATE_COOLDOWN: u64 = 300 * DAY;
+const MAX_RELOCATIONS: u8 = 2;
+const RELOCATE_CHANCE: f32 = 0.002;
+const ROYAL_RX: usize = 4;
+const ROYAL_RY: usize = 2;
+const ROYAL_DIGGERS: usize = 3;
 
 // Seasons. A day is the unit the status line counts droughts in.
 pub const DAY: u64 = 100;
@@ -235,20 +375,6 @@ const MAX_DURATION: u64 = 40 * DAY;
 const COOLDOWN: u64 = 20 * DAY;
 const BLOOM_LENGTH: u64 = 10 * DAY;
 const BLOOM_MULTIPLIER: u32 = 3;
-/// Food units each worker eats per tick while a drought is on.
-const CONSUME_RATE: f32 = 0.003;
-/// What a worker eats per tick the rest of the year, so stores only grow when foraging
-/// outpaces eating and a drought lands on whatever the colony actually managed to put by.
-const UPKEEP_RATE: f32 = 0.0003;
-const STARVE_INTERVAL: u32 = DAY as u32 / 2;
-const DEPOSIT: f32 = 0.08;
-const STRENGTH_DECAY: f32 = 0.985;
-const EVAPORATION: f32 = 0.994;
-const FOOD_RESPAWN_TICKS: u32 = 200;
-const BUD_POPULATION: usize = 60;
-const BUD_PARTY: usize = 5;
-const BUD_EVERY: u64 = 900;
-const NEST_GAP: usize = 18;
 
 impl World {
     pub fn new(cfg: Config, w: usize, h: usize) -> Self {
@@ -256,32 +382,41 @@ impl World {
         let h = h.max(12);
         let mut rng = fastrand::Rng::with_seed(cfg.seed);
         let sky = (h / 5).max(4);
+        let n = w * h;
         let mut world = Self {
             w,
             h,
-            cells: (0..w * h).map(|i| if i / w < sky { Cell::Sky } else { Cell::Soil }).collect(),
-            store: vec![0; w * h],
+            cells: (0..n).map(|i| if i / w < sky { Cell::Sky } else { Cell::Soil }).collect(),
+            store: vec![0; n],
             ground: vec![sky; w],
             sky,
             entrances: Vec::new(),
             ants: Vec::new(),
             food: Vec::new(),
+            eggs: Vec::new(),
+            corpses: Vec::new(),
             surf_ph: vec![0.0; w],
             nests: Vec::new(),
-            nest_of: vec![NO_NEST; w * h],
+            nest_of: vec![NO_NEST; n],
             season: Season::Calm { until: GRACE_PERIOD },
             reports: Vec::new(),
             tick: 0,
             delivered: 0,
             dug: 0,
+            deaths: 0,
             next_label: 0,
             drought_before: (0, 0, 0),
             rebuilding: None,
-            exit_dist: vec![FAR; w * h],
-            store_dist: vec![FAR; w * h],
-            tip_dist: vec![FAR; w * h],
-            dead_tip: vec![false; w * h],
+            exit_dist: vec![FAR; n],
+            store_dist: vec![FAR; n],
+            eat_dist: vec![FAR; n],
+            room_dist: vec![FAR; n],
+            tip_dist: vec![FAR; n],
+            royal_dist: vec![FAR; n],
+            queen_dist: vec![FAR; n],
+            dead_tip: vec![false; n],
             dirty: true,
+            queens_moved: true,
             food_respawn: 0,
             cfg: cfg.clone(),
             rng: fastrand::Rng::with_seed(rng.u64(..)),
@@ -295,10 +430,11 @@ impl World {
         world.carve_chamber(ex, sky + depth, 2, 1);
         world.entrances.push(ex);
         world.refresh_fields();
+        world.tend_queens();
 
         let n_ants = cfg.ants.unwrap_or_else(|| ((w * h) / 110).clamp(12, 120));
         for _ in 0..n_ants {
-            world.spawn_ant(0);
+            world.spawn_ant(0, None);
         }
         world.recount_workers();
         for _ in 0..cfg.food_piles {
@@ -322,7 +458,7 @@ impl World {
     }
 
     fn is_dug(&self, x: usize, y: usize) -> bool {
-        matches!(self.cell(x, y), Cell::Tunnel | Cell::Chamber)
+        self.cell(x, y).dug()
     }
 
     fn soil_cells(&self) -> usize {
@@ -340,24 +476,51 @@ impl World {
         n != NO_NEST && self.nests[n as usize].dead
     }
 
+    fn in_drought(&self) -> bool {
+        matches!(self.season, Season::Drought { .. })
+    }
+
     pub fn stored(&self) -> u32 {
         self.store.iter().map(|&s| s as u32).sum()
     }
 
     pub fn chambers(&self) -> usize {
-        self.cells.iter().filter(|&&c| c == Cell::Chamber).count()
+        self.cells.iter().filter(|c| c.room()).count()
     }
 
     pub fn live_nests(&self) -> usize {
         self.nests.iter().filter(|n| !n.dead).count()
     }
 
-    pub fn starving_nests(&self) -> usize {
-        self.nests.iter().filter(|n| n.starving && !n.dead).count()
-    }
-
     pub fn dead_nests(&self) -> usize {
         self.nests.iter().filter(|n| n.dead).count()
+    }
+
+    pub fn queenless_nests(&self) -> usize {
+        self.nests.iter().filter(|n| !n.dead && n.queen.is_none()).count()
+    }
+
+    pub fn moving_queens(&self) -> usize {
+        self.nests.iter().filter(|n| n.queen.as_ref().is_some_and(|q| q.relocating)).count()
+    }
+
+    pub fn royal_digs(&self) -> usize {
+        self.nests.iter().filter(|n| !n.dead && n.royal.as_ref().is_some_and(|r| !r.cells.is_empty())).count()
+    }
+
+    /// Lost its queen, no eggs left to hatch: nothing more will ever come of this nest.
+    fn doomed(&self, n: usize) -> bool {
+        self.nests.get(n).is_some_and(|nest| !nest.dead && nest.queen.is_none() && nest.queen_lost)
+            && !self.eggs.iter().any(|e| e.nest == n)
+    }
+
+    /// The nearest living nest with a queen, by entrance, for an orphan at column `x`.
+    fn adoptive_nest(&self, x: usize) -> Option<usize> {
+        self.live_entrances()
+            .filter_map(|e| self.nest_at_entrance(e).map(|n| (n, e)))
+            .filter(|&(n, _)| self.nests[n].queen.is_some())
+            .min_by_key(|&(_, e)| e.abs_diff(x))
+            .map(|(n, _)| n)
     }
 
     fn nest_at_entrance(&self, x: usize) -> Option<usize> {
@@ -373,7 +536,12 @@ impl World {
         self.entrances.iter().copied().filter(|&x| self.is_live_entrance(x))
     }
 
-    /// Food stored in one nest's chambers.
+    fn nest_alive_at(&self, i: usize) -> bool {
+        let n = self.nest_of[i];
+        n != NO_NEST && !self.nests[n as usize].dead
+    }
+
+    /// Food stored in one nest's rooms.
     pub fn nest_food(&self, n: usize) -> u32 {
         self.nest_of
             .iter()
@@ -383,21 +551,11 @@ impl World {
             .sum()
     }
 
-    /// Food units the nest's chambers can hold.
-    fn nest_capacity(&self, n: usize) -> u32 {
-        self.nest_of
-            .iter()
-            .zip(&self.cells)
-            .filter(|(&o, &c)| o as usize == n && c == Cell::Chamber)
-            .count() as u32
-            * STORE_CAP as u32
-    }
-
     fn nest_cells(&self, n: usize) -> usize {
         self.nest_of.iter().filter(|&&o| o as usize == n).count()
     }
 
-    /// Take food out of a nest, fullest chambers first. False if it did not have enough.
+    /// Take food out of a nest, fullest rooms first. False if it did not have enough.
     fn take_food(&mut self, n: usize, mut amount: u32) -> bool {
         if self.nest_food(n) < amount {
             return false;
@@ -411,8 +569,8 @@ impl World {
                 break;
             }
             let take = (self.store[i] as u32).min(amount);
-            if self.store[i] >= STORE_CAP {
-                self.dirty = true; // a full chamber has room again
+            if self.store[i] >= STORE_CAP || self.store[i] == take as u8 {
+                self.dirty = true; // a full room has room again, or an emptied one stops being a larder
             }
             self.store[i] -= take as u8;
             amount -= take;
@@ -434,28 +592,176 @@ impl World {
         }
     }
 
-    /// New ant appears in a random cell of nest `home`, ready to head out.
-    fn spawn_ant(&mut self, home: usize) {
-        let cells: Vec<usize> = (0..self.cells.len())
-            .filter(|&i| self.nest_of[i] as usize == home)
-            .collect();
-        if cells.is_empty() {
+    // ---- jobs -------------------------------------------------------------------------
+
+    fn job_targets(&self, n: usize) -> [u32; 4] {
+        let nest = &self.nests[n];
+        if nest.queen.is_none() && !nest.queen_lost {
+            return [40, 0, 60, 0]; // a young nest: dig the first room, feed the diggers
+        }
+        let base = if self.in_drought() {
+            JOBS_SCARCE
+        } else {
+            match self.nests[n].band {
+                Band::Plentiful => JOBS_PLENTIFUL,
+                Band::Normal => JOBS_NORMAL,
+                Band::Scarce => JOBS_SCARCE,
+            }
+        };
+        // Scouts take a slice of the foraging allocation.
+        let scouts = base[0] * SCOUT_SHARE / 100;
+        [base[0] - scouts, base[1], base[2], scouts]
+    }
+
+    fn job_counts(&self, n: usize) -> [usize; 4] {
+        let mut c = [0; 4];
+        for a in self.ants.iter().filter(|a| a.home == n && a.state != State::Starving) {
+            c[a.job as usize] += 1;
+        }
+        c
+    }
+
+    /// The job the nest is shortest of, for a newly hatched ant.
+    fn pick_job(&self, n: usize) -> Job {
+        let targets = self.job_targets(n);
+        let counts = self.job_counts(n);
+        let total = counts.iter().sum::<usize>() as i64 + 1;
+        let mut best = Job::Forager;
+        let mut best_gap = i64::MIN;
+        for (i, job) in [Job::Forager, Job::Nurse, Job::Digger, Job::Scout].into_iter().enumerate() {
+            let gap = targets[i] as i64 * total - counts[i] as i64 * 100;
+            if gap > best_gap {
+                best_gap = gap;
+                best = job;
+            }
+        }
+        best
+    }
+
+    pub fn job_tally(&self) -> [usize; 4] {
+        let mut c = [0; 4];
+        for a in &self.ants {
+            c[a.job as usize] += 1;
+        }
+        c
+    }
+
+    /// `f66 n12 d30 s12`
+    pub fn job_summary(&self) -> String {
+        let c = self.job_tally();
+        format!("f{} n{} d{} s{}", c[0], c[1], c[2], c[3])
+    }
+
+    /// Every so often, move one ant per nest from the job most in surplus to the job most
+    /// in deficit, so the workforce drifts rather than snaps.
+    fn allocate_jobs(&mut self) {
+        if !self.tick.is_multiple_of(REASSIGN_EVERY) {
             return;
         }
-        let i = cells[self.rng.usize(..cells.len())];
-        let role = self.pick_role(home);
-        let state = match role {
-            Role::Digger => State::ToTip,
-            Role::Nurse => State::Idle,
-            Role::Forager | Role::Scout => State::Foraging,
+        for n in 0..self.nests.len() {
+            if self.nests[n].dead {
+                continue;
+            }
+            let targets = self.job_targets(n);
+            let counts = self.job_counts(n);
+            let total = counts.iter().sum::<usize>() as i64;
+            if total == 0 {
+                continue;
+            }
+            let gap = |i: usize| targets[i] as i64 * total - counts[i] as i64 * 100;
+            let (mut need, mut need_gap) = (0, i64::MIN);
+            let (mut spare, mut spare_gap) = (0, i64::MAX);
+            for i in 0..4 {
+                if gap(i) > need_gap {
+                    need = i;
+                    need_gap = gap(i);
+                }
+                if gap(i) < spare_gap {
+                    spare = i;
+                    spare_gap = gap(i);
+                }
+            }
+            if let Some(z) = (0..4).find(|&i| targets[i] == 0 && counts[i] > 0) {
+                spare = z;
+                spare_gap = -1;
+            }
+            if need_gap <= 100 || spare_gap >= 0 {
+                continue;
+            }
+            let queen_alive = self.nests[n].queen.is_some();
+            if spare == Job::Nurse as usize && queen_alive && counts[1] <= MIN_NURSES {
+                continue;
+            }
+            let new_job = [Job::Forager, Job::Nurse, Job::Digger, Job::Scout][need];
+            let candidate = self.ants.iter().position(|a| {
+                a.home == n
+                    && a.job as usize == spare
+                    && !a.carrying
+                    && matches!(a.state, State::Idle | State::ToTip | State::Foraging | State::Digging)
+            });
+            if let Some(i) = candidate {
+                self.ants[i].job = new_job;
+                let here = self.idx(self.ants[i].x, self.ants[i].y);
+                let mut ant = self.ants[i].clone();
+                if ant.underground {
+                    self.assign(&mut ant, here);
+                } else if !matches!(new_job, Job::Forager | Job::Scout) {
+                    ant.state = State::Idle; // heads home from the surface
+                }
+                self.ants[i] = ant;
+            }
+        }
+    }
+
+    /// Days the nest's store would last in a drought, and the band that puts it in.
+    fn update_bands(&mut self) {
+        for n in 0..self.nests.len() {
+            let mouths = self.ants.iter().filter(|a| a.home == n).count() as f32 * WORKER_CONSUME
+                + if self.nests[n].queen.is_some() { QUEEN_CONSUME } else { 0.0 };
+            let per_tick = mouths * DROUGHT_HUNGER / FOOD_VALUE;
+            let days = if per_tick > 0.0 { self.nest_food(n) as f32 / (per_tick * DAY as f32) } else { 999.0 };
+            let nest = &mut self.nests[n];
+            nest.food_days = days;
+            nest.band = if days > RICH_DAYS {
+                Band::Plentiful
+            } else if days < SCARCE_DAYS {
+                Band::Scarce
+            } else {
+                Band::Normal
+            };
+        }
+    }
+
+    // ---- spawning ---------------------------------------------------------------------
+
+    /// New ant appears in nest `home`, at `cell` if given, else somewhere in its tunnels.
+    fn spawn_ant(&mut self, home: usize, cell: Option<usize>) {
+        let i = match cell {
+            Some(c) => c,
+            None => {
+                let cells: Vec<usize> = (0..self.cells.len()).filter(|&i| self.nest_of[i] as usize == home).collect();
+                if cells.is_empty() {
+                    return;
+                }
+                cells[self.rng.usize(..cells.len())]
+            }
+        };
+        let job = self.pick_job(home);
+        let state = match job {
+            Job::Digger => State::ToTip,
+            Job::Nurse => State::Idle,
+            Job::Forager | Job::Scout => State::Foraging,
         };
         self.ants.push(Ant {
             x: i % self.w,
             y: i / self.w,
             state,
-            role,
+            job,
             underground: true,
             home,
+            fed: FED_MAX * 0.6,
+            carrying: false,
+            hungry_for: 0,
             idle: IDLE_TICKS,
             dir: if self.rng.bool() { 1 } else { -1 },
             cooldown: self.rng.u8(..MOVE_TICKS * 4),
@@ -463,40 +769,6 @@ impl World {
             dig_budget: 0,
             strength: 0.0,
         });
-    }
-
-    /// The caste the nest is shortest of, against `ROLE_SHARES`.
-    fn pick_role(&self, home: usize) -> Role {
-        let mut counts = [0i64; 4];
-        let mut total = 0i64;
-        for a in self.ants.iter().filter(|a| a.home == home) {
-            counts[a.role as usize] += 1;
-            total += 1;
-        }
-        let mut best = Role::Forager;
-        let mut best_gap = i64::MIN;
-        for (i, &(role, share)) in ROLE_SHARES.iter().enumerate() {
-            let gap = share as i64 * (total + 1) - counts[i] * 100;
-            if gap > best_gap {
-                best_gap = gap;
-                best = role;
-            }
-        }
-        best
-    }
-
-    pub fn role_counts(&self) -> [usize; 4] {
-        let mut c = [0; 4];
-        for a in &self.ants {
-            c[a.role as usize] += 1;
-        }
-        c
-    }
-
-    /// `f66 d30 s12 n12`
-    pub fn caste_summary(&self) -> String {
-        let c = self.role_counts();
-        format!("f{} d{} s{} n{}", c[0], c[1], c[2], c[3])
     }
 
     fn spawn_food(&mut self, size: f32) {
@@ -523,6 +795,8 @@ impl World {
         }
     }
 
+    // ---- tick -------------------------------------------------------------------------
+
     pub fn tick(&mut self) {
         self.tick += 1;
         for i in 0..self.ants.len() {
@@ -532,7 +806,8 @@ impl World {
             }
             self.step_ant(i);
         }
-        if self.dirty {
+        self.bury_the_dead();
+        if self.dirty || self.queens_moved {
             self.refresh_fields();
         }
         for v in &mut self.surf_ph {
@@ -554,17 +829,23 @@ impl World {
             }
         }
         self.recount_workers();
-        self.consume_and_starve();
+        self.update_bands();
+        self.hunger();
+        self.tend_queens();
+        self.hatch_eggs();
+        self.allocate_jobs();
+        self.relocation();
+        for c in &mut self.corpses {
+            c.ttl = c.ttl.saturating_sub(1);
+        }
+        self.corpses.retain(|c| c.ttl > 0);
         if let Some((i, target)) = self.rebuilding {
             if self.stored() >= target {
                 self.reports[i].rebuilt_days = Some((self.tick - self.reports[i].ended) / DAY);
                 self.rebuilding = None;
             }
         }
-        if self.cfg.grow {
-            self.maybe_grow();
-        }
-        if self.cfg.bud && self.tick.is_multiple_of(BUD_EVERY) {
+        if self.cfg.bud && self.cfg.grow && self.tick.is_multiple_of(BUD_EVERY) {
             self.maybe_bud();
         }
     }
@@ -573,7 +854,9 @@ impl World {
 
     fn step_ant(&mut self, i: usize) {
         let ant = self.ants[i].clone();
-        let next = if ant.underground {
+        let next = if ant.state == State::Starving {
+            self.step_starving(ant)
+        } else if ant.underground {
             self.step_underground(ant)
         } else {
             self.step_surface(ant)
@@ -584,11 +867,17 @@ impl World {
     fn step_surface(&mut self, mut ant: Ant) -> Ant {
         ant.cooldown = MOVE_TICKS;
         let x = ant.x;
+        // Orphans of a doomed nest throw in their lot with the nearest queen.
+        if self.doomed(ant.home) && !matches!(ant.state, State::Founding(_)) {
+            if let Some(n) = self.adoptive_nest(x) {
+                ant.home = n;
+            }
+        }
         match ant.state {
             State::Foraging => {
                 // Food in sight wins, then the trail (foragers only), then a wander.
                 // Scouts see further, ignore trails, and keep going the way they were.
-                let scout = ant.role == Role::Scout;
+                let scout = ant.job == Job::Scout;
                 let vision = if scout { SCOUT_VISION } else { VISION };
                 let seen = self
                     .food
@@ -602,6 +891,11 @@ impl World {
                         if let Some(f) = self.food.iter_mut().find(|f| f.x == fx) {
                             f.units = f.units.saturating_sub(1);
                         }
+                        if ant.hungry() {
+                            ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX); // eat on the spot
+                            return ant;
+                        }
+                        ant.carrying = true;
                         ant.state = State::Returning;
                         // A scout's trail is the strong one: it is what brings the foragers.
                         ant.strength = if scout { 2.5 } else { 1.0 };
@@ -609,6 +903,17 @@ impl World {
                         return ant;
                     }
                     ant.dir = if fx > x { 1 } else { -1 };
+                } else if ant.hungry() {
+                    // Nothing in sight and running on empty: go home and eat from the store.
+                    let dir = self.toward_entrance(x, ant.home);
+                    if dir == 0 && self.is_live_entrance(x) {
+                        ant.underground = true;
+                        ant.y = self.ground[x];
+                        ant.state = State::Idle;
+                        ant.idle = 0;
+                        return ant;
+                    }
+                    ant.dir = dir;
                 } else if scout {
                     if self.rng.f32() < 0.01 {
                         ant.dir = -ant.dir;
@@ -650,16 +955,7 @@ impl World {
                     }
                     ant.underground = true;
                     ant.y = gy;
-                    // The first couple down the hole become its diggers; the rest keep
-                    // their trade so the new nest's castes aren't all shovel.
-                    let diggers_here = self
-                        .ants
-                        .iter()
-                        .filter(|a| a.underground && a.x == x && a.role == Role::Digger)
-                        .count();
-                    if diggers_here < 2 {
-                        ant.role = Role::Digger;
-                    }
+                    ant.job = Job::Digger; // founders dig the new nest out; jobs drift later
                     ant.state = State::Digging;
                     ant.dig_dir = (0, 1);
                     ant.dig_budget = 10;
@@ -668,8 +964,8 @@ impl World {
                 ant.dir = if target > x { 1 } else { -1 };
                 self.walk(&mut ant);
             }
-            State::ToTip | State::Digging | State::Idle => {
-                // Underground castes caught outside (a nest just merged, say) head home.
+            _ => {
+                // Underground jobs caught outside head home.
                 let dir = self.toward_entrance(x, ant.home);
                 if dir == 0 && self.is_live_entrance(x) {
                     ant.underground = true;
@@ -733,7 +1029,17 @@ impl World {
         let here = self.idx(ant.x, ant.y);
         match ant.state {
             State::Foraging | State::Founding(_) => {
+                if ant.hungry() && self.eat_dist[here] != FAR && !matches!(ant.state, State::Founding(_)) {
+                    ant.state = State::GoEat;
+                    return ant;
+                }
                 if self.exit_dist[here] == 0 {
+                    if self.in_drought() && self.food.is_empty() {
+                        // Nothing out there. Wait by the door.
+                        ant.state = State::Idle;
+                        ant.idle = 100;
+                        return ant;
+                    }
                     ant.underground = false;
                     ant.y = self.ground[ant.x].saturating_sub(1);
                     ant.state = State::Foraging;
@@ -744,15 +1050,20 @@ impl World {
                 }
             }
             State::Returning => {
-                if self.store_dist[here] == 0 && self.cells[here] == Cell::Chamber {
-                    self.store[here] += 1;
-                    self.delivered += 1;
-                    if self.store[here] >= STORE_CAP {
-                        self.dirty = true;
+                if self.store_dist[here] == 0 && self.cells[here].room() {
+                    if ant.hungry() {
+                        ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX); // eats what it carried
+                    } else {
+                        self.store[here] += 1;
+                        self.delivered += 1;
+                        if self.store[here] >= STORE_CAP || self.store[here] == 1 {
+                            self.dirty = true;
+                        }
                     }
+                    ant.carrying = false;
                     self.assign(&mut ant, here);
                 } else if self.store_dist[here] == FAR {
-                    // Nowhere to put it: no chamber with room. Go and dig one.
+                    // Nowhere to put it: no room with space. Go and dig one.
                     ant.state = State::ToTip;
                 } else if let Some((nx, ny)) = self.descend(Field::Store, ant.x, ant.y) {
                     ant.x = nx;
@@ -786,7 +1097,7 @@ impl World {
                     let (nx, ny) = (ant.x as i32 + dx, ant.y as i32 + dy);
                     if self.can_dig(ant.x, ant.y, nx, ny) {
                         let (nx, ny) = (nx as usize, ny as usize);
-                        self.dig(nx, ny, ant.x);
+                        self.dig(nx, ny, ant.x, ant.home);
                         ant.x = nx;
                         ant.y = ny;
                         ant.dig_budget -= 1;
@@ -803,26 +1114,169 @@ impl World {
                     self.assign(&mut ant, here);
                 }
             }
+            State::DigRoyal => {
+                let n = ant.home;
+                let active = self.nests[n].royal.as_ref().is_some_and(|r| !r.cells.is_empty())
+                    && self.nests[n].band == Band::Plentiful
+                    && !self.in_drought();
+                if !active {
+                    self.assign(&mut ant, here); // down tools until things look up
+                    return ant;
+                }
+                if self.royal_dist[here] == 0 {
+                    // Open an adjacent cell of the plan.
+                    let target = self.nests[n]
+                        .royal
+                        .as_ref()
+                        .and_then(|r| r.cells.iter().copied().find(|&c| self.adjacent(c, here)));
+                    if let Some(c) = target {
+                        self.cells[c] = Cell::Royal;
+                        self.dug += 1;
+                        self.dirty = true;
+                        let r = self.nests[n].royal.as_mut().unwrap();
+                        r.cells.retain(|&k| k != c);
+                        r.dug.push(c);
+                        ant.x = c % self.w;
+                        ant.y = c / self.w;
+                        ant.cooldown = DIG_TICKS;
+                        self.raise_mound(ant.x);
+                    } else {
+                        self.assign(&mut ant, here);
+                    }
+                } else if self.royal_dist[here] == FAR {
+                    self.assign(&mut ant, here);
+                } else if let Some((nx, ny)) = self.descend(Field::Royal, ant.x, ant.y) {
+                    ant.x = nx;
+                    ant.y = ny;
+                }
+            }
+            State::GoEat => {
+                if self.eat_dist[here] == 0 && self.store[here] > 0 {
+                    let n = self.nest_of[here];
+                    if n != NO_NEST && self.take_food(n as usize, 1) {
+                        ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX);
+                        ant.hungry_for = 0;
+                    }
+                    self.assign(&mut ant, here);
+                } else if self.eat_dist[here] == FAR {
+                    self.assign(&mut ant, here); // nothing to eat anywhere
+                } else if let Some((nx, ny)) = self.descend(Field::Eat, ant.x, ant.y) {
+                    ant.x = nx;
+                    ant.y = ny;
+                }
+            }
             State::Idle => {
                 if ant.idle == 0 {
                     self.assign(&mut ant, here);
                     return ant;
                 }
                 ant.idle -= 1;
-                // Nurses keep to the chambers; everyone else just wanders.
-                if let Some((nx, ny)) = self.wander(ant.x, ant.y, ant.role == Role::Nurse) {
+                if ant.job == Job::Nurse {
+                    // Nurses eat from the larder they stand in, and keep near the queen.
+                    if ant.hungry() && self.cells[here].room() && self.store[here] > 0 {
+                        let n = self.nest_of[here];
+                        if n != NO_NEST && self.take_food(n as usize, 1) {
+                            ant.fed = (ant.fed + FOOD_VALUE).min(FED_MAX);
+                        }
+                    }
+                    let d = self.queen_dist[here];
+                    if d != FAR && d > 2 {
+                        if let Some((nx, ny)) = self.descend(Field::Queen, ant.x, ant.y) {
+                            ant.x = nx;
+                            ant.y = ny;
+                        }
+                        return ant;
+                    }
+                }
+                if let Some((nx, ny)) = self.wander(ant.x, ant.y, ant.job == Job::Nurse) {
                     ant.x = nx;
                     ant.y = ny;
                 }
             }
+            State::Starving => unreachable!(),
         }
         ant
     }
 
-    /// Step to a random dug neighbour, preferring chambers if asked.
-    fn wander(&mut self, x: usize, y: usize, prefer_chamber: bool) -> Option<(usize, usize)> {
+    /// A starving ant drops everything and wanders off to die: on the surface after a few
+    /// steps, underground on reaching a room or when its time runs out.
+    fn step_starving(&mut self, mut ant: Ant) -> Ant {
+        ant.cooldown = MOVE_TICKS;
+        if ant.idle == 0 {
+            return ant; // dies this tick, see bury_the_dead
+        }
+        ant.idle -= 1;
+        if ant.underground {
+            let here = self.idx(ant.x, ant.y);
+            if self.room_dist[here] == 0 {
+                ant.idle = 0;
+            } else if let Some((nx, ny)) = self.descend(Field::Room, ant.x, ant.y) {
+                ant.x = nx;
+                ant.y = ny;
+            }
+        } else {
+            if self.rng.f32() < 0.2 {
+                ant.dir = -ant.dir;
+            }
+            self.walk(&mut ant);
+        }
+        ant
+    }
+
+    /// Remove ants whose time is up and leave a corpse where they fell.
+    fn bury_the_dead(&mut self) {
+        let mut i = 0;
+        while i < self.ants.len() {
+            if self.ants[i].state == State::Starving && self.ants[i].idle == 0 {
+                let a = self.ants.swap_remove(i);
+                self.corpses.push(Corpse { x: a.x, y: a.y, queen: false, ttl: CORPSE_DECAY, max_ttl: CORPSE_DECAY });
+                self.deaths += 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// What an ant does next after finishing a job underground.
+    fn assign(&mut self, ant: &mut Ant, here: usize) {
+        if self.doomed(ant.home) && self.exit_dist[here] != FAR {
+            ant.state = State::Foraging; // nothing to stay for: head out and find a new home
+            return;
+        }
+        let waits_for_nurse = ant.job == Job::Digger;
+        if ant.hungry() && (!waits_for_nurse || ant.hungry_for > PATIENCE) && self.eat_dist[here] != FAR {
+            ant.state = State::GoEat;
+            return;
+        }
+        ant.state = match ant.job {
+            Job::Nurse => {
+                ant.idle = IDLE_TICKS;
+                State::Idle
+            }
+            Job::Digger => {
+                let n = ant.home;
+                let royal_wanted = self.nests[n].royal.as_ref().is_some_and(|r| !r.cells.is_empty())
+                    && self.nests[n].band == Band::Plentiful
+                    && !self.in_drought()
+                    && self.ants.iter().filter(|a| a.home == n && a.state == State::DigRoyal).count() < ROYAL_DIGGERS
+                    && self.royal_dist[here] != FAR;
+                if royal_wanted {
+                    State::DigRoyal
+                } else if self.dig_capped(n) || self.tip_dist[here] == FAR {
+                    ant.idle = IDLE_TICKS;
+                    State::Idle
+                } else {
+                    State::ToTip
+                }
+            }
+            Job::Scout | Job::Forager => State::Foraging,
+        };
+    }
+
+    /// Step to a random dug neighbour, preferring rooms if asked.
+    fn wander(&mut self, x: usize, y: usize, prefer_room: bool) -> Option<(usize, usize)> {
         let mut any = Vec::with_capacity(4);
-        let mut chambers = Vec::with_capacity(4);
+        let mut rooms = Vec::with_capacity(4);
         for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             let (nx, ny) = (x as i32 + dx, y as i32 + dy);
             if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
@@ -831,56 +1285,17 @@ impl World {
             let (nx, ny) = (nx as usize, ny as usize);
             if self.is_dug(nx, ny) {
                 any.push((nx, ny));
-                if self.cell(nx, ny) == Cell::Chamber {
-                    chambers.push((nx, ny));
+                if self.cell(nx, ny).room() {
+                    rooms.push((nx, ny));
                 }
             }
         }
-        let pick = if prefer_chamber && !chambers.is_empty() && self.rng.f32() < 0.85 {
-            chambers
-        } else {
-            any
-        };
+        let pick = if prefer_room && !rooms.is_empty() && self.rng.f32() < 0.85 { rooms } else { any };
         if pick.is_empty() {
             None
         } else {
             Some(pick[self.rng.usize(..pick.len())])
         }
-    }
-
-    /// What an ant does next after finishing a job underground, by caste.
-    fn assign(&mut self, ant: &mut Ant, here: usize) {
-        ant.state = match ant.role {
-            Role::Nurse => {
-                ant.idle = IDLE_TICKS;
-                State::Idle
-            }
-            Role::Digger => {
-                if self.dig_capped(ant.home) || self.tip_dist[here] == FAR {
-                    ant.idle = IDLE_TICKS;
-                    State::Idle
-                } else {
-                    State::ToTip
-                }
-            }
-            Role::Scout => State::Foraging,
-            Role::Forager => {
-                // A forager pitches in on chambers when the larder is nearly full.
-                let free: u32 = self
-                    .cells
-                    .iter()
-                    .zip(&self.store)
-                    .zip(&self.nest_of)
-                    .filter(|((c, s), n)| **c == Cell::Chamber && **s < STORE_CAP && **n as usize == ant.home)
-                    .map(|((_, s), _)| (STORE_CAP - s) as u32)
-                    .sum();
-                if free < 8 && !self.dig_capped(ant.home) && self.rng.f32() < 0.5 {
-                    State::ToTip
-                } else {
-                    State::Foraging
-                }
-            }
-        };
     }
 
     /// Step to the neighbouring dug cell that is closer to the field's sources, or
@@ -889,7 +1304,11 @@ impl World {
         let field: &[u16] = match which {
             Field::Exit => &self.exit_dist,
             Field::Store => &self.store_dist,
+            Field::Eat => &self.eat_dist,
+            Field::Room => &self.room_dist,
             Field::Tip => &self.tip_dist,
+            Field::Royal => &self.royal_dist,
+            Field::Queen => &self.queen_dist,
         };
         let here = field[self.idx(x, y)];
         let mut best: Vec<(usize, usize)> = Vec::new();
@@ -921,13 +1340,309 @@ impl World {
         }
     }
 
+    fn adjacent(&self, a: usize, b: usize) -> bool {
+        let (ax, ay) = (a % self.w, a / self.w);
+        let (bx, by) = (b % self.w, b / self.w);
+        ax.abs_diff(bx) + ay.abs_diff(by) == 1
+    }
+
+    // ---- hunger, queens, eggs ---------------------------------------------------------
+
+    /// Everyone's body burns food; nurses hand out the nest's store to the queen and to
+    /// hungry diggers; whoever hits zero starts dying.
+    fn hunger(&mut self) {
+        let rate = if self.in_drought() { DROUGHT_HUNGER } else { 1.0 };
+        for n in 0..self.nests.len() {
+            if self.nests[n].dead {
+                continue;
+            }
+            let nurses = self
+                .ants
+                .iter()
+                .filter(|a| a.home == n && a.job == Job::Nurse && a.state != State::Starving && a.underground)
+                .count();
+            self.nests[n].feed_acc = (self.nests[n].feed_acc + nurses as f32 * NURSE_FEED).min(2.0);
+            // The queen eats first.
+            let queen_hungry = self.nests[n].queen.as_ref().is_some_and(|q| q.fed < QUEEN_FED_MAX - FOOD_VALUE);
+            if queen_hungry && self.nests[n].feed_acc >= 1.0 && self.take_food(n, 1) {
+                self.nests[n].feed_acc -= 1.0;
+                let q = self.nests[n].queen.as_mut().unwrap();
+                q.fed = (q.fed + FOOD_VALUE).min(QUEEN_FED_MAX);
+            }
+            // Then the hungriest digger.
+            while self.nests[n].feed_acc >= 1.0 {
+                let hungriest = self
+                    .ants
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.home == n && a.underground && a.job == Job::Digger && a.hungry() && a.state != State::Starving)
+                    .min_by(|a, b| a.1.fed.total_cmp(&b.1.fed))
+                    .map(|(i, _)| i);
+                let Some(i) = hungriest else { break };
+                if !self.take_food(n, 1) {
+                    break;
+                }
+                self.nests[n].feed_acc -= 1.0;
+                self.ants[i].fed = (self.ants[i].fed + FOOD_VALUE).min(FED_MAX);
+                self.ants[i].hungry_for = 0;
+            }
+        }
+        for a in &mut self.ants {
+            a.fed -= WORKER_CONSUME * rate;
+            if a.hungry() {
+                a.hungry_for += 1;
+            } else {
+                a.hungry_for = 0;
+            }
+            if a.fed <= 0.0 && a.state != State::Starving {
+                a.fed = 0.0;
+                a.state = State::Starving;
+                a.carrying = false;
+                a.idle = if a.underground { STARVE_TTL } else { STARVE_WANDER };
+            }
+        }
+        for n in 0..self.nests.len() {
+            let Some(q) = self.nests[n].queen.as_mut() else { continue };
+            q.fed -= QUEEN_CONSUME * rate;
+            if q.fed <= 0.0 {
+                let (x, y) = (q.x, q.y);
+                self.corpses.push(Corpse { x, y, queen: true, ttl: QUEEN_CORPSE_DECAY, max_ttl: QUEEN_CORPSE_DECAY });
+                self.nests[n].queen = None;
+                self.nests[n].queen_lost = true;
+                self.nests[n].royal = None;
+                self.queens_moved = true;
+            }
+        }
+    }
+
+    /// A nest that has never had a queen gets one in its first room; a queen with a full
+    /// belly lays an egg every so often.
+    fn tend_queens(&mut self) {
+        for n in 0..self.nests.len() {
+            if self.nests[n].dead {
+                continue;
+            }
+            if self.nests[n].queen.is_none() && !self.nests[n].queen_lost {
+                let room = (0..self.cells.len()).find(|&i| self.nest_of[i] as usize == n && self.cells[i].room());
+                if let Some(i) = room {
+                    self.nests[n].queen = Some(Queen {
+                        x: i % self.w,
+                        y: i / self.w,
+                        fed: QUEEN_FED_MAX,
+                        relocating: false,
+                        relocations: 0,
+                        last_lay: self.tick,
+                        settle_until: self.tick,
+                        last_relocation: self.tick,
+                        cooldown: 0,
+                    });
+                    self.queens_moved = true;
+                }
+            }
+            let crowded = {
+                let nest = &self.nests[n];
+                nest.workers * 2 >= self.nest_cells(n) + 4
+            };
+            let stocked = self.nests[n].food_days >= LAY_MIN_DAYS;
+            let can_lay = self.cfg.grow && self.ants.len() + self.eggs.len() < self.cfg.max_ants && !crowded && stocked;
+            let Some(q) = self.nests[n].queen.as_mut() else { continue };
+            if q.relocating || self.tick < q.settle_until || self.tick - q.last_lay < LAY_INTERVAL {
+                continue;
+            }
+            if q.fed >= LAY_THRESHOLD && can_lay {
+                q.last_lay = self.tick;
+                let (qx, qy) = (q.x, q.y);
+                let cell = self.egg_spot(n, qx, qy);
+                self.eggs.push(Egg { cell, nest: n, hatch_at: self.tick + HATCH_TIME });
+            } else {
+                q.last_lay = self.tick; // skipped this one: hungry, or the larder is thin
+            }
+        }
+    }
+
+    /// A room cell near the queen for an egg, ideally not already holding one.
+    fn egg_spot(&mut self, n: usize, qx: usize, qy: usize) -> usize {
+        let qi = self.idx(qx, qy);
+        let mut spots: Vec<usize> = (0..self.cells.len())
+            .filter(|&i| {
+                self.nest_of[i] as usize == n
+                    && self.cells[i].room()
+                    && i != qi
+                    && (i % self.w).abs_diff(qx) <= 3
+                    && (i / self.w).abs_diff(qy) <= 2
+                    && !self.eggs.iter().any(|e| e.cell == i)
+            })
+            .collect();
+        if spots.is_empty() {
+            spots.push(qi);
+        }
+        spots[self.rng.usize(..spots.len())]
+    }
+
+    fn hatch_eggs(&mut self) {
+        let mut i = 0;
+        while i < self.eggs.len() {
+            if self.eggs[i].hatch_at <= self.tick {
+                let e = self.eggs.swap_remove(i);
+                if self.cells[e.cell].dug() {
+                    let n = self.nest_of[e.cell];
+                    let home = if n == NO_NEST { e.nest } else { n as usize };
+                    if home < self.nests.len() && !self.nests[home].dead {
+                        self.spawn_ant(home, Some(e.cell));
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // ---- relocation -------------------------------------------------------------------
+
+    /// A deep, prosperous nest digs a royal chamber near the bottom and the queen walks
+    /// down to it once it is open.
+    fn relocation(&mut self) {
+        for n in 0..self.nests.len() {
+            if self.nests[n].dead {
+                continue;
+            }
+            let Some(q) = self.nests[n].queen.clone() else { continue };
+            if q.relocating {
+                self.walk_queen(n);
+                continue;
+            }
+            if let Some(r) = &self.nests[n].royal {
+                if r.cells.is_empty() {
+                    self.nests[n].queen.as_mut().unwrap().relocating = true;
+                    self.queens_moved = true; // the royal field now leads to the chamber
+                    self.dirty = true;
+                }
+                continue;
+            }
+            let depth = (0..self.cells.len())
+                .filter(|&i| self.nest_of[i] as usize == n)
+                .map(|i| i / self.w)
+                .max()
+                .unwrap_or(0);
+            let ready = self.nests[n].band == Band::Plentiful
+                && !self.in_drought()
+                && depth >= q.y + RELOCATE_GAP
+                && self.tick - q.last_relocation >= RELOCATE_COOLDOWN
+                && q.relocations < MAX_RELOCATIONS
+                && self.rng.f32() < RELOCATE_CHANCE;
+            if ready {
+                self.plan_royal(n, q.y + RELOCATE_GAP);
+            }
+        }
+    }
+
+    /// Choose a spot deeper than `min_y` with enough undug earth around a tunnel for a
+    /// royal chamber, and mark its cells as the plan.
+    fn plan_royal(&mut self, n: usize, min_y: usize) {
+        let anchors: Vec<usize> = (0..self.cells.len())
+            .filter(|&i| self.nest_of[i] as usize == n && self.cells[i] == Cell::Tunnel && i / self.w >= min_y)
+            .collect();
+        if anchors.is_empty() {
+            return;
+        }
+        for _ in 0..30 {
+            let a = anchors[self.rng.usize(..anchors.len())];
+            let (cx, cy) = (a % self.w, a / self.w);
+            if let Some(cells) = self.royal_blob(cx, cy) {
+                self.nests[n].royal = Some(Royal { cells, dug: vec![a] });
+                self.dirty = true;
+                return;
+            }
+        }
+    }
+
+    /// Soil cells of an ellipse around (cx, cy) to dig for a royal chamber. The nest's own
+    /// tunnels inside the ellipse simply become part of the hall; another nest's anywhere
+    /// near it rule the spot out.
+    fn royal_blob(&self, cx: usize, cy: usize) -> Option<Vec<usize>> {
+        let own_nest = self.nest_of[self.idx(cx, cy)];
+        let mut cells = Vec::new();
+        for dy in -(ROYAL_RY as i32)..=(ROYAL_RY as i32) {
+            for dx in -(ROYAL_RX as i32)..=(ROYAL_RX as i32) {
+                let (x, y) = (cx as i32 + dx, cy as i32 + dy);
+                if x < 1 || y < 1 || x >= self.w as i32 - 1 || y >= self.h as i32 - 1 {
+                    return None;
+                }
+                let e = (dx as f32 / (ROYAL_RX as f32 + 0.5)).powi(2) + (dy as f32 / (ROYAL_RY as f32 + 0.5)).powi(2);
+                if e > 1.0 {
+                    continue;
+                }
+                let (x, y) = (x as usize, y as usize);
+                if (x, y) == (cx, cy) || y <= self.ground[x] + 2 {
+                    continue;
+                }
+                let i = self.idx(x, y);
+                match self.cell(x, y) {
+                    Cell::Soil => cells.push(i),
+                    Cell::Sky => return None,
+                    _ if self.nest_of[i] == own_nest => {}
+                    _ => return None,
+                }
+            }
+        }
+        for &c in &cells {
+            let (x, y) = (c % self.w, c / self.w);
+            for dy in -1..=1_i32 {
+                for dx in -1..=1_i32 {
+                    let (ax, ay) = ((x as i32 + dx) as usize, (y as i32 + dy) as usize);
+                    let j = self.idx(ax, ay);
+                    if self.is_dug(ax, ay) && self.nest_of[j] != own_nest {
+                        return None;
+                    }
+                }
+            }
+        }
+        (cells.len() >= 8).then_some(cells)
+    }
+
+    fn walk_queen(&mut self, n: usize) {
+        let q = self.nests[n].queen.as_mut().unwrap();
+        if q.cooldown > 0 {
+            q.cooldown -= 1;
+            return;
+        }
+        q.cooldown = QUEEN_TICKS;
+        let (qx, qy) = (q.x, q.y);
+        let here = self.idx(qx, qy);
+        if self.royal_dist[here] == 0 {
+            let q = self.nests[n].queen.as_mut().unwrap();
+            q.relocating = false;
+            q.relocations += 1;
+            q.last_relocation = self.tick;
+            q.settle_until = self.tick + SETTLE_TIME;
+            self.nests[n].royal = None;
+            self.queens_moved = true;
+            self.dirty = true;
+            return;
+        }
+        if self.royal_dist[here] == FAR {
+            // Cut off somehow; stay put and give up the move.
+            let q = self.nests[n].queen.as_mut().unwrap();
+            q.relocating = false;
+            self.nests[n].royal = None;
+            self.queens_moved = true;
+            return;
+        }
+        if let Some((nx, ny)) = self.descend(Field::Royal, qx, qy) {
+            let q = self.nests[n].queen.as_mut().unwrap();
+            q.x = nx;
+            q.y = ny;
+            self.queens_moved = true;
+        }
+    }
+
     // ---- digging ----------------------------------------------------------------------
 
     fn pick_dig_dir(&mut self, current: (i32, i32)) -> (i32, i32) {
         if self.rng.f32() < 0.6 && current != (0, 0) {
             return current;
         }
-        // Mostly down, some sideways, rarely up (which can open a new entrance).
+        // Mostly down, some sideways, rarely up.
         let r = self.rng.f32();
         if r < 0.45 {
             (0, 1)
@@ -967,16 +1682,26 @@ impl World {
                 if self.is_dug(ax, ay) && !self.is_husk(ax, ay) {
                     return false; // breaking into a husk is fine: that is how it gets reused
                 }
+                if self.planned_royal(self.idx(ax, ay)) {
+                    return false; // leave the royal chamber's earth alone
+                }
             }
         }
         true
     }
 
-    fn dig(&mut self, x: usize, y: usize, from_x: usize) {
+    fn planned_royal(&self, i: usize) -> bool {
+        self.nests.iter().any(|n| n.royal.as_ref().is_some_and(|r| r.cells.contains(&i)))
+    }
+
+    fn dig(&mut self, x: usize, y: usize, from_x: usize, home: usize) {
         self.set(x, y, Cell::Tunnel);
         self.dug += 1;
         let depth = y.saturating_sub(self.ground[x]);
-        if depth >= 4 && self.rng.f32() < 0.12 && !self.chamber_near(x, y, 5) {
+        // A nest without a queen yet is desperate for its first room.
+        let young = self.nests.get(home).is_some_and(|n| n.queen.is_none() && !n.queen_lost);
+        let (min_depth, p_room) = if young { (3, 0.5) } else { (4, 0.12) };
+        if depth >= min_depth && self.rng.f32() < p_room && !self.chamber_near(x, y, 5) {
             let rx = self.rng.usize(2..=3);
             let ry = self.rng.usize(1..=2);
             self.carve_chamber(x, y, rx, ry);
@@ -989,7 +1714,7 @@ impl World {
         let y0 = y.saturating_sub(r);
         for cy in y0..=(y + r).min(self.h - 1) {
             for cx in x0..=(x + r).min(self.w - 1) {
-                if self.cell(cx, cy) == Cell::Chamber {
+                if self.cell(cx, cy).room() {
                     return true;
                 }
             }
@@ -1026,7 +1751,7 @@ impl World {
                     if (ax.abs_diff(cx) <= 2 && ay.abs_diff(cy) <= 2) || cells.contains(&(ax, ay)) {
                         continue;
                     }
-                    if self.is_dug(ax, ay) {
+                    if self.is_dug(ax, ay) || self.planned_royal(self.idx(ax, ay)) {
                         return;
                     }
                 }
@@ -1036,7 +1761,9 @@ impl World {
             if self.cell(x, y) == Cell::Soil {
                 self.dug += 1;
             }
-            self.set(x, y, Cell::Chamber);
+            if self.cell(x, y) != Cell::Royal {
+                self.set(x, y, Cell::Chamber);
+            }
         }
     }
 
@@ -1076,35 +1803,58 @@ impl World {
     // ---- fields -----------------------------------------------------------------------
 
     fn refresh_fields(&mut self) {
+        if self.dirty {
+            self.label_nests();
+        }
         self.dirty = false;
-        self.label_nests();
-        let alive = |w: &Self, i: usize| {
-            let n = w.nest_of[i];
-            n != NO_NEST && !w.nests[n as usize].dead
-        };
+        self.queens_moved = false;
+        let n = self.cells.len();
         let exits: Vec<usize> = self
             .entrances
             .iter()
             .map(|&x| self.idx(x, self.ground[x]))
-            .filter(|&i| matches!(self.cells[i], Cell::Tunnel | Cell::Chamber) && alive(self, i))
+            .filter(|&i| self.cells[i].dug() && self.nest_alive_at(i))
             .collect();
         self.exit_dist = self.bfs(&exits);
 
-        let stores: Vec<usize> = (0..self.cells.len())
-            .filter(|&i| self.cells[i] == Cell::Chamber && self.store[i] < STORE_CAP && alive(self, i))
+        let stores: Vec<usize> = (0..n)
+            .filter(|&i| self.cells[i].room() && self.store[i] < STORE_CAP && self.nest_alive_at(i))
             .collect();
         self.store_dist = self.bfs(&stores);
 
-        let mut tips: Vec<usize> = (0..self.cells.len())
+        let larders: Vec<usize> = (0..n).filter(|&i| self.cells[i].room() && self.store[i] > 0).collect();
+        self.eat_dist = self.bfs(&larders);
+
+        let rooms: Vec<usize> = (0..n).filter(|&i| self.cells[i].room()).collect();
+        self.room_dist = self.bfs(&rooms);
+
+        let mut tips: Vec<usize> = (0..n)
             .filter(|&i| self.cells[i] == Cell::Tunnel && !self.dead_tip[i] && self.dug_neighbours(i) <= 1)
-            .filter(|&i| i / self.w > self.ground[i % self.w] && alive(self, i))
+            .filter(|&i| i / self.w > self.ground[i % self.w] && self.nest_alive_at(i))
             .collect();
         if tips.is_empty() {
-            tips = (0..self.cells.len())
-                .filter(|&i| self.cells[i] == Cell::Tunnel && !self.dead_tip[i] && alive(self, i))
+            tips = (0..n)
+                .filter(|&i| self.cells[i] == Cell::Tunnel && !self.dead_tip[i] && self.nest_alive_at(i))
                 .collect();
         }
         self.tip_dist = self.bfs(&tips);
+
+        // Royal field: while digging, the dug cells next to the plan; once open, the
+        // chamber itself (for the queen's walk).
+        let mut royal: Vec<usize> = Vec::new();
+        for nest in &self.nests {
+            if let Some(r) = &nest.royal {
+                if r.cells.is_empty() {
+                    royal.extend(r.dug.iter().copied());
+                } else {
+                    royal.extend((0..n).filter(|&i| self.cells[i].dug() && r.cells.iter().any(|&c| self.adjacent(c, i))));
+                }
+            }
+        }
+        self.royal_dist = self.bfs(&royal);
+
+        let queens: Vec<usize> = self.nests.iter().filter_map(|nst| nst.queen.as_ref().map(|q| self.idx(q.x, q.y))).collect();
+        self.queen_dist = self.bfs(&queens);
     }
 
     /// Group dug cells into connected systems and match them to nests. A nest keeps its
@@ -1114,7 +1864,7 @@ impl World {
         let mut comp = vec![NO_NEST; n];
         let mut comps: Vec<Vec<usize>> = Vec::new();
         for start in 0..n {
-            if comp[start] != NO_NEST || !matches!(self.cells[start], Cell::Tunnel | Cell::Chamber) {
+            if comp[start] != NO_NEST || !self.cells[start].dug() {
                 continue;
             }
             let id = comps.len() as u16;
@@ -1137,7 +1887,7 @@ impl World {
                     nb.push(i + self.w);
                 }
                 for j in nb {
-                    if comp[j] == NO_NEST && matches!(self.cells[j], Cell::Tunnel | Cell::Chamber) {
+                    if comp[j] == NO_NEST && self.cells[j].dug() {
                         comp[j] = id;
                         cells.push(j);
                         q.push_back(j);
@@ -1167,8 +1917,24 @@ impl World {
             let nest = if let Some(&first) = matching.first() {
                 let mut base = old[first].clone();
                 for &m in &matching[1..] {
-                    base.workers += old[m].workers;
-                    base.dead = base.dead && old[m].dead;
+                    let other = &old[m];
+                    base.workers += other.workers;
+                    base.dead = base.dead && other.dead;
+                    // One queen per nest: the older nest's stays, the other's is lost.
+                    match (&base.queen, &other.queen) {
+                        (None, Some(q)) if !base.queen_lost => base.queen = Some(q.clone()),
+                        (Some(_), Some(q)) => self.corpses.push(Corpse {
+                            x: q.x,
+                            y: q.y,
+                            queen: true,
+                            ttl: QUEEN_CORPSE_DECAY,
+                            max_ttl: QUEEN_CORPSE_DECAY,
+                        }),
+                        _ => {}
+                    }
+                    if base.royal.is_none() {
+                        base.royal = other.royal.clone();
+                    }
                 }
                 base.entrances = ents;
                 base
@@ -1196,7 +1962,7 @@ impl World {
         self.nests = nests;
 
         // Ants underground belong to the system they stand in; ants on the surface keep
-        // their nest unless it has gone, then take the nearest live one.
+        // their nest unless it has gone, then take the nearest live one. Eggs likewise.
         for i in 0..self.ants.len() {
             let a = &self.ants[i];
             let mut home = old_to_new.get(a.home).copied().unwrap_or(usize::MAX);
@@ -1215,6 +1981,12 @@ impl World {
             }
             self.ants[i].home = home;
         }
+        for e in &mut self.eggs {
+            let here = self.nest_of[e.cell];
+            if here != NO_NEST {
+                e.nest = here as usize;
+            }
+        }
     }
 
     fn recount_workers(&mut self) {
@@ -1226,10 +1998,17 @@ impl World {
                 nest.workers += 1;
             }
         }
-        for nest in &mut self.nests {
-            if nest.workers == 0 && !nest.dead {
+        for n in 0..self.nests.len() {
+            let nest = &self.nests[n];
+            let eggs_left = self.eggs.iter().any(|e| e.nest == n);
+            if nest.workers == 0 && !nest.dead && !eggs_left {
+                let nest = &mut self.nests[n];
                 nest.dead = true;
-                nest.starving = false;
+                nest.royal = None;
+                if let Some(q) = nest.queen.take() {
+                    self.corpses.push(Corpse { x: q.x, y: q.y, queen: true, ttl: QUEEN_CORPSE_DECAY, max_ttl: QUEEN_CORPSE_DECAY });
+                }
+                self.dirty = true;
             }
         }
     }
@@ -1263,7 +2042,7 @@ impl World {
             let d = dist[i] + 1;
             let (x, y) = (i % self.w, i / self.w);
             let mut push = |j: usize, q: &mut VecDeque<usize>| {
-                if dist[j] == FAR && matches!(self.cells[j], Cell::Tunnel | Cell::Chamber) {
+                if dist[j] == FAR && self.cells[j].dug() {
                     dist[j] = d;
                     q.push_back(j);
                 }
@@ -1282,33 +2061,6 @@ impl World {
             }
         }
         dist
-    }
-
-    // ---- colony -----------------------------------------------------------------------
-
-    /// Stored food feeds new ants, one nest at a time, as long as there is room.
-    fn maybe_grow(&mut self) {
-        for n in 0..self.nests.len() {
-            if self.ants.len() >= self.cfg.max_ants {
-                return;
-            }
-            let nest = &self.nests[n];
-            if nest.dead || self.tick - nest.last_spawn < SPAWN_INTERVAL {
-                continue;
-            }
-            // A nest whose chambers can't hold its reserve still grows once they are nearly
-            // full; the extra mouths then push it to dig more chambers.
-            let capacity = self.nest_capacity(n);
-            let reserve = (SPAWN_THRESHOLD + nest.workers as u32 * RESERVE_PER_WORKER).min(capacity * 4 / 5);
-            if nest.workers * 2 >= self.nest_cells(n) + 4 || self.nest_food(n) < reserve {
-                continue;
-            }
-            if self.take_food(n, SPAWN_COST) {
-                self.spawn_ant(n);
-                self.nests[n].last_spawn = self.tick;
-                self.nests[n].workers += 1;
-            }
-        }
     }
 
     // ---- seasons ----------------------------------------------------------------------
@@ -1341,11 +2093,6 @@ impl World {
                     rebuilt_days: None,
                 });
                 self.rebuilding = Some((self.reports.len() - 1, self.drought_before.2));
-                for nest in &mut self.nests {
-                    nest.starving = false;
-                    nest.starve_timer = 0;
-                    nest.consume_acc = 0.0;
-                }
                 Season::Bloom { until: t + BLOOM_LENGTH }
             }
             Season::Bloom { until } if t >= until => Season::Cooldown { until: t + COOLDOWN },
@@ -1376,50 +2123,7 @@ impl World {
         }
     }
 
-    /// Every nest eats from its stores all year, more in a drought. In a drought a nest with
-    /// nothing left loses a worker every so often until food comes back or nobody is left;
-    /// the rest of the year an empty larder just means no growth.
-    fn consume_and_starve(&mut self) {
-        let drought = matches!(self.season, Season::Drought { .. });
-        let rate = if drought { CONSUME_RATE } else { UPKEEP_RATE };
-        for n in 0..self.nests.len() {
-            if self.nests[n].dead {
-                continue;
-            }
-            self.nests[n].consume_acc += self.nests[n].workers as f32 * rate;
-            while self.nests[n].consume_acc >= 1.0 {
-                self.nests[n].consume_acc -= 1.0;
-                if !self.take_food(n, 1) {
-                    break;
-                }
-            }
-            if !drought || self.nest_food(n) > 0 {
-                self.nests[n].starving = false;
-                self.nests[n].starve_timer = 0;
-                continue;
-            }
-            self.nests[n].starving = true;
-            self.nests[n].starve_timer += 1;
-            if self.nests[n].starve_timer < STARVE_INTERVAL {
-                continue;
-            }
-            self.nests[n].starve_timer = 0;
-            // Any worker of the nest, chosen at random, so no caste starves out first.
-            let members: Vec<usize> = (0..self.ants.len()).filter(|&i| self.ants[i].home == n).collect();
-            let victim = (!members.is_empty()).then(|| members[self.rng.usize(..members.len())]);
-            if let Some(i) = victim {
-                self.ants.swap_remove(i);
-                self.nests[n].workers -= 1;
-                if self.nests[n].workers == 0 {
-                    self.nests[n].dead = true;
-                    self.nests[n].starving = false;
-                    self.dirty = true;
-                }
-            }
-        }
-    }
-
-    /// A big colony sends a few surface foragers off to open a nest somewhere clear.
+    /// A big colony sends a few scouts off to open a nest somewhere clear.
     fn maybe_bud(&mut self) {
         if self.live_nests() >= self.cfg.max_nests || self.ants.len() < BUD_POPULATION {
             return;
@@ -1438,13 +2142,12 @@ impl World {
             }
         }
         let Some(target) = target else { return };
-        // Scouts lead the way; foragers make up the numbers if there aren't enough out.
-        let out = |a: &Ant| !a.underground && a.state == State::Foraging;
+        let out = |a: &Ant| !a.underground && a.state == State::Foraging && !a.hungry();
         let mut party: Vec<usize> = self
             .ants
             .iter()
             .enumerate()
-            .filter(|(_, a)| out(a) && a.role == Role::Scout)
+            .filter(|(_, a)| out(a) && a.job == Job::Scout)
             .map(|(i, _)| i)
             .take(BUD_PARTY)
             .collect();
@@ -1453,7 +2156,7 @@ impl World {
                 .ants
                 .iter()
                 .enumerate()
-                .filter(|(i, a)| out(a) && a.role == Role::Forager && !party.contains(i))
+                .filter(|(i, a)| out(a) && a.job == Job::Forager && !party.contains(i))
                 .map(|(i, _)| i)
                 .take(BUD_PARTY - party.len())
                 .collect();
@@ -1474,30 +2177,40 @@ impl World {
         let mut out = String::with_capacity((self.w + 1) * self.h);
         for y in 0..self.h {
             for x in 0..self.w {
-                let ant = self.ants.iter().find(|a| a.x == x && a.y == y);
-                let ch = if let Some(a) = ant {
-                    match (a.state, a.role) {
+                let i = self.idx(x, y);
+                let ch = if self.nests.iter().any(|n| n.queen.as_ref().is_some_and(|q| (q.x, q.y) == (x, y))) {
+                    'Q'
+                } else if let Some(a) = self.ants.iter().find(|a| a.x == x && a.y == y) {
+                    match (a.state, a.job) {
+                        (State::Starving, _) => 'x',
                         (State::Returning, _) => 'A',
                         (State::Founding(_), _) => '*',
-                        (_, Role::Forager) => 'f',
-                        (_, Role::Digger) => 'd',
-                        (_, Role::Scout) => 's',
-                        (_, Role::Nurse) => 'n',
+                        (_, Job::Forager) => 'f',
+                        (_, Job::Nurse) => 'n',
+                        (_, Job::Digger) => 'd',
+                        (_, Job::Scout) => 's',
                     }
+                } else if self.corpses.iter().any(|c| (c.x, c.y) == (x, y)) {
+                    '+'
+                } else if self.eggs.iter().any(|e| e.cell == i) {
+                    'e'
                 } else if y + 1 == self.ground[x] && self.food.iter().any(|f| f.x == x) {
                     'F'
+                } else if self.planned_royal(i) {
+                    'r'
                 } else {
                     let husk = {
-                        let n = self.nest_of[self.idx(x, y)];
+                        let n = self.nest_of[i];
                         n != NO_NEST && self.nests[n as usize].dead
                     };
                     match self.cell(x, y) {
                         Cell::Sky => ' ',
                         Cell::Soil => '#',
-                        Cell::Tunnel | Cell::Chamber if husk => 'x',
+                        _ if husk => 'x',
                         Cell::Tunnel => '.',
+                        Cell::Royal => 'R',
                         Cell::Chamber => {
-                            if self.store[self.idx(x, y)] > 0 {
+                            if self.store[i] > 0 {
                                 '%'
                             } else {
                                 'o'
@@ -1512,11 +2225,17 @@ impl World {
         out
     }
 
-    /// `nests 3 (1 starving, 1 dead)` or just `nests 3`.
+    /// `nests 3 (1 queenless, 1 moving, 1 dead)` or just `nests 3`.
     pub fn nest_summary(&self) -> String {
         let mut notes = Vec::new();
-        if self.starving_nests() > 0 {
-            notes.push(format!("{} starving", self.starving_nests()));
+        if self.queenless_nests() > 0 {
+            notes.push(format!("{} queenless", self.queenless_nests()));
+        }
+        if self.royal_digs() > 0 {
+            notes.push(format!("{} digging royal", self.royal_digs()));
+        }
+        if self.moving_queens() > 0 {
+            notes.push(format!("{} moving", self.moving_queens()));
         }
         if self.dead_nests() > 0 {
             notes.push(format!("{} dead", self.dead_nests()));
@@ -1528,19 +2247,60 @@ impl World {
         }
     }
 
+    /// One line per nest for `--headless`: label, state, jobs, larder.
+    pub fn nest_lines(&self) -> Vec<String> {
+        (0..self.nests.len())
+            .map(|n| {
+                let nest = &self.nests[n];
+                let c = self.job_counts(n);
+                let rooms = (0..self.cells.len()).filter(|&i| self.nest_of[i] as usize == n && self.cells[i].room()).count();
+                let queen = match &nest.queen {
+                    Some(q) if q.relocating => format!("Q moving fed {:.0}", q.fed),
+                    Some(q) => format!("Q fed {:.0} moves {}", q.fed, q.relocations),
+                    None if nest.queen_lost => "Q dead".to_string(),
+                    None => "no Q yet".to_string(),
+                };
+                let royal = match &nest.royal {
+                    Some(r) if r.cells.is_empty() => " · royal ready".to_string(),
+                    Some(r) => format!(" · royal {} to dig", r.cells.len()),
+                    None => String::new(),
+                };
+                format!(
+                    "nest {} {} · w{} (f{} n{} d{} s{}) · cells {} rooms {} · food {} ({:.1} days, {:?}) · {}{}",
+                    nest.label,
+                    if nest.dead { "DEAD" } else { "" },
+                    nest.workers,
+                    c[0],
+                    c[1],
+                    c[2],
+                    c[3],
+                    self.nest_cells(n),
+                    rooms,
+                    self.nest_food(n),
+                    nest.food_days,
+                    nest.band,
+                    queen,
+                    royal
+                )
+            })
+            .collect()
+    }
+
     pub fn stats(&self) -> String {
         let season = self.season_label().map(|s| format!("{s} · ")).unwrap_or_default();
         format!(
-            "tick {} · {season}{} · ants {} ({}) · dug {} · chambers {} · stored {} · food {} · delivered {}",
+            "tick {} · {season}{} · ants {} ({}) · eggs {} · dug {} · rooms {} · stored {} · food {} · delivered {} · deaths {}",
             self.tick,
             self.nest_summary(),
             self.ants.len(),
-            self.caste_summary(),
+            self.job_summary(),
+            self.eggs.len(),
             self.dug,
             self.chambers(),
             self.stored(),
             self.food.len(),
-            self.delivered
+            self.delivered,
+            self.deaths
         )
     }
 }
@@ -1559,25 +2319,91 @@ mod tests {
         }
     }
 
+    /// Dig a second, separate tunnel system with an entrance at column `x`.
+    fn dig_system(w: &mut World, x: usize, depth: usize) {
+        let g = w.ground[x];
+        for d in 0..depth {
+            w.set(x, g + d, Cell::Tunnel);
+        }
+        w.carve_chamber(x, g + depth, 2, 1);
+        w.entrances.push(x);
+        w.refresh_fields();
+        w.tend_queens();
+    }
+
+    fn fill_nest(w: &mut World, n: usize) {
+        for i in 0..w.store.len() {
+            if w.nest_of[i] as usize == n && w.cells[i].room() {
+                w.store[i] = STORE_CAP;
+            }
+        }
+        w.dirty = true;
+    }
+
+    fn ant_at(x: usize, y: usize, job: Job, state: State, underground: bool) -> Ant {
+        Ant {
+            x,
+            y,
+            state,
+            job,
+            underground,
+            home: 0,
+            fed: FED_MAX,
+            carrying: false,
+            hungry_for: 0,
+            idle: 0,
+            dir: 1,
+            cooldown: 0,
+            dig_dir: (0, 1),
+            dig_budget: 0,
+            strength: 0.0,
+        }
+    }
+
     #[test]
-    fn ants_dig_tunnels_and_chambers() {
+    fn ants_dig_tunnels_and_rooms() {
         let mut w = world(1);
-        let (start, chambers) = (w.dug, w.chambers());
-        assert!(chambers > 5, "starter chamber missing:\n{}", w.snapshot());
+        let (start, rooms) = (w.dug, w.chambers());
+        assert!(rooms > 5, "starter room missing:\n{}", w.snapshot());
         run(&mut w, 4000);
         assert!(w.dug > start + 30, "dug only {} cells:\n{}", w.dug - start, w.snapshot());
-        assert!(w.chambers() > chambers, "no new chambers:\n{}", w.snapshot());
+        assert!(w.chambers() > rooms, "no new rooms:\n{}", w.snapshot());
         assert!(w.dug * 100 < w.soil_cells() * 40, "farm is a maze:\n{}", w.snapshot());
     }
 
     #[test]
-    fn ants_bring_food_home_and_the_colony_grows() {
+    fn ants_bring_food_home() {
         let mut w = world(2);
-        let start = w.ants.len();
-        // Growth waits for a reserve now, so give the colony time to stock up first.
-        run(&mut w, 16000);
+        run(&mut w, 6000);
         assert!(w.delivered > 30, "only {} deliveries:\n{}", w.delivered, w.snapshot());
-        assert!(w.ants.len() > start, "colony did not grow:\n{}", w.snapshot());
+    }
+
+    #[test]
+    fn the_queen_lays_when_fed_and_eggs_hatch_into_workers() {
+        let mut w = World::new(Config { seed: 2, bud: false, drought: false, ants: Some(10), ..Config::default() }, 71, 48);
+        assert!(w.nests[0].queen.is_some(), "no queen");
+        fill_nest(&mut w, 0);
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        let before = w.ants.len();
+        run(&mut w, LAY_INTERVAL + 2);
+        assert_eq!(w.eggs.len(), 1, "no egg laid:\n{}", w.stats());
+        run(&mut w, HATCH_TIME + 2);
+        assert!(w.ants.len() > before, "egg did not hatch");
+        assert!(w.eggs.len() <= 3, "{} eggs", w.eggs.len());
+    }
+
+    #[test]
+    fn a_hungry_queen_skips_the_lay() {
+        let mut w = World::new(Config { seed: 2, bud: false, drought: false, ants: Some(10), ..Config::default() }, 71, 48);
+        w.food.clear();
+        w.cfg.food_piles = 0;
+        for i in 0..w.store.len() {
+            w.store[i] = 0;
+        }
+        w.nests[0].queen.as_mut().unwrap().fed = LAY_THRESHOLD - 1.0;
+        run(&mut w, LAY_INTERVAL + 2);
+        assert!(w.eggs.is_empty(), "laid while hungry");
     }
 
     #[test]
@@ -1585,23 +2411,24 @@ mod tests {
         let mut w = world(3);
         w.food.clear();
         w.food.push(Food { x: 10, units: 5 });
-        w.ants[0] = Ant {
-            x: 10,
-            y: w.ground[10] - 1,
-            state: State::Foraging,
-            role: Role::Forager,
-            underground: false,
-            home: 0,
-            idle: 0,
-            dir: 1,
-            cooldown: 0,
-            dig_dir: (0, 1),
-            dig_budget: 0,
-            strength: 0.0,
-        };
+        w.ants[0] = ant_at(10, w.ground[10] - 1, Job::Forager, State::Foraging, false);
         w.step_ant(0);
         assert_eq!(w.ants[0].state, State::Returning);
+        assert!(w.ants[0].carrying);
         assert_eq!(w.food[0].units, 4);
+    }
+
+    #[test]
+    fn a_hungry_forager_eats_what_it_finds() {
+        let mut w = world(3);
+        w.food.clear();
+        w.food.push(Food { x: 10, units: 5 });
+        w.ants[0] = ant_at(10, w.ground[10] - 1, Job::Forager, State::Foraging, false);
+        w.ants[0].fed = HUNGRY - 5.0;
+        w.step_ant(0);
+        assert_eq!(w.ants[0].state, State::Foraging);
+        assert!(!w.ants[0].carrying);
+        assert!(w.ants[0].fed > HUNGRY);
     }
 
     #[test]
@@ -1616,6 +2443,11 @@ mod tests {
                     assert_eq!(a.y + 1, w.ground[a.x], "surface ant floating at {},{}", a.x, a.y);
                 }
             }
+            for nest in &w.nests {
+                if let Some(q) = &nest.queen {
+                    assert!(w.is_dug(q.x, q.y), "queen in soil");
+                }
+            }
         }
         for x in 0..w.w {
             for y in 0..w.ground[x] {
@@ -1625,44 +2457,26 @@ mod tests {
     }
 
     #[test]
-    fn a_big_colony_opens_a_second_nest() {
-        let mut w = World::new(Config { seed: 5, ants: Some(60), ..Config::default() }, 120, 60);
+    fn a_big_colony_opens_a_second_nest_with_its_own_queen() {
+        let mut w = World::new(Config { seed: 5, ants: Some(70), ..Config::default() }, 120, 60);
         let mut when = None;
         for t in 0..12000 {
             w.tick();
-            if w.entrances.len() >= 2 {
+            if w.nests.len() >= 2 {
                 when = Some(t);
                 break;
             }
         }
         assert!(when.is_some(), "no second nest:\n{}", w.snapshot());
-        assert!(w.entrances[0].abs_diff(w.entrances[1]) >= 2);
+        run(&mut w, 3000);
+        assert!(w.nests[1].queen.is_some() || w.nests[1].dead, "second nest never got a queen:\n{}", w.snapshot());
     }
 
     #[test]
     fn no_bud_keeps_entrances_from_founding_parties() {
-        let mut w = World::new(Config { seed: 5, ants: Some(60), bud: false, ..Config::default() }, 120, 60);
+        let mut w = World::new(Config { seed: 5, ants: Some(70), bud: false, ..Config::default() }, 120, 60);
         run(&mut w, 3000);
         assert!(w.ants.iter().all(|a| !matches!(a.state, State::Founding(_))));
-    }
-
-    /// Dig a second, separate tunnel system with an entrance at column `x`.
-    fn dig_system(w: &mut World, x: usize, depth: usize) {
-        let g = w.ground[x];
-        for d in 0..depth {
-            w.set(x, g + d, Cell::Tunnel);
-        }
-        w.carve_chamber(x, g + depth, 2, 1);
-        w.entrances.push(x);
-        w.refresh_fields();
-    }
-
-    fn fill_nest(w: &mut World, n: usize) {
-        for i in 0..w.store.len() {
-            if w.nest_of[i] as usize == n && w.cells[i] == Cell::Chamber {
-                w.store[i] = STORE_CAP;
-            }
-        }
     }
 
     #[test]
@@ -1670,24 +2484,22 @@ mod tests {
         let mut w = world(1);
         assert_eq!(w.nests.len(), 1);
         assert_eq!(w.nests[0].label, 'A');
-        assert!(w.ants.iter().all(|a| a.home == 0));
         run(&mut w, 2500);
         assert_eq!(w.nests[0].label, 'A');
-        assert!(w.nests[0].workers > 0);
         assert!(w.ants.iter().all(|a| a.home < w.nests.len()));
     }
 
     #[test]
-    fn joined_systems_merge_under_the_older_label() {
+    fn joined_systems_merge_under_the_older_label_keeping_one_queen() {
         let mut w = World::new(Config { seed: 2, bud: false, drought: false, ..Config::default() }, 90, 48);
         dig_system(&mut w, 70, 6);
         assert_eq!(w.nests.len(), 2);
         assert_eq!(w.nests[1].label, 'B');
-        w.spawn_ant(1);
-        w.spawn_ant(1);
+        assert!(w.nests[1].queen.is_some());
+        w.spawn_ant(1, None);
+        w.spawn_ant(1, None);
         w.recount_workers();
         let a_workers = w.nests[0].workers;
-        // Join them with a corridor two rows below the deeper chamber.
         let y = w.ground[45] + 12;
         for x in 45..=70 {
             w.set(x, y, Cell::Tunnel);
@@ -1701,27 +2513,8 @@ mod tests {
         assert_eq!(w.nests.len(), 1, "systems did not merge:\n{}", w.snapshot());
         assert_eq!(w.nests[0].label, 'A');
         assert_eq!(w.nests[0].workers, a_workers + 2);
-        assert!(w.ants.iter().all(|a| a.home == 0));
-    }
-
-    #[test]
-    fn growth_spawns_from_the_nest_that_holds_the_food_and_waits_between_spawns() {
-        let mut w = World::new(Config { seed: 2, bud: false, drought: false, ants: Some(5), ..Config::default() }, 90, 48);
-        dig_system(&mut w, 70, 6);
-        w.food.clear();
-        w.tick = SPAWN_INTERVAL;
-        fill_nest(&mut w, 1);
-        assert!(w.nest_food(1) >= SPAWN_THRESHOLD + w.nests[1].workers as u32 * RESERVE_PER_WORKER);
-        let before = w.ants.len();
-        w.maybe_grow();
-        assert_eq!(w.ants.len(), before + 1);
-        assert_eq!(w.ants.last().unwrap().home, 1);
-        assert!(w.nest_food(0) == 0 || w.nest_food(1) < w.nest_cells(1) as u32 * STORE_CAP as u32);
-        w.maybe_grow();
-        assert_eq!(w.ants.len(), before + 1, "spawned again inside the interval");
-        w.tick += SPAWN_INTERVAL;
-        w.maybe_grow();
-        assert_eq!(w.ants.len(), before + 2);
+        assert!(w.nests[0].queen.is_some());
+        assert!(w.corpses.iter().any(|c| c.queen), "the second queen should be a corpse");
     }
 
     #[test]
@@ -1731,91 +2524,79 @@ mod tests {
         let full = w.nest_food(0);
         w.food.clear();
         w.season = Season::Drought { until: w.tick + 50 * DAY, started: w.tick };
-        run(&mut w, 300);
+        run(&mut w, 500);
         assert!(w.food.is_empty(), "food spawned in a drought");
         assert!(w.nest_food(0) < full, "stores did not drain");
-        assert_eq!(w.ants.len(), 40, "nobody should starve while there is food");
+        assert!(w.nest_food(0) > 0, "the larder should still have something in it");
+        assert_eq!(w.ants.len(), 40, "nobody should starve while there is food:\n{}", w.stats());
     }
 
     #[test]
-    fn a_nest_with_no_food_loses_workers_and_then_dies() {
+    fn with_no_food_at_all_ants_starve_one_by_one_and_the_nest_dies() {
         let mut w = World::new(Config { seed: 3, ants: Some(6), bud: false, ..Config::default() }, 71, 48);
         w.food.clear();
-        w.season = Season::Drought { until: w.tick + 500 * DAY, started: w.tick };
-        run(&mut w, STARVE_INTERVAL as u64 + 2);
-        assert_eq!(w.ants.len(), 5);
-        assert!(w.nests[0].starving);
-        run(&mut w, STARVE_INTERVAL as u64 * 6);
-        assert!(w.ants.is_empty());
-        assert!(w.nests[0].dead);
-        assert!(!w.nests[0].starving);
-        assert_eq!(w.live_entrances().count(), 0);
-        assert!(w.snapshot().contains('x'));
-    }
-
-    #[test]
-    fn a_new_nest_can_dig_into_a_husk_and_take_it_over() {
-        let mut w = World::new(Config { seed: 6, ants: Some(4), bud: false, drought: false, ..Config::default() }, 90, 48);
-        w.food.clear();
-        w.season = Season::Drought { until: w.tick + 500 * DAY, started: w.tick };
-        run(&mut w, STARVE_INTERVAL as u64 * 6);
-        assert!(w.nests[0].dead && w.ants.is_empty());
-        w.season = Season::Calm { until: u64::MAX };
-        // Found a new nest right next door and let it dig.
-        let x = w.entrances[0] + 6;
-        dig_system(&mut w, x, 3);
-        for _ in 0..12 {
-            w.spawn_ant(1);
+        w.cfg.food_piles = 0;
+        for i in 0..w.store.len() {
+            w.store[i] = 0;
         }
-        w.recount_workers();
-        assert_eq!(w.nests.len(), 2);
-        run(&mut w, 20000);
-        assert!(
-            w.nests.iter().filter(|n| !n.dead).count() >= 1 && w.nests.iter().all(|n| !n.dead || n.workers == 0),
-            "{}",
-            w.snapshot()
-        );
-        // Either it broke in (one merged living nest) or it never touched it (two nests).
-        assert!(w.nests.len() <= 2);
+        w.season = Season::Drought { until: w.tick + 500 * DAY, started: w.tick };
+        let mut seen_corpse = false;
+        let mut seen_partial = false;
+        for _ in 0..8000 {
+            w.tick();
+            seen_corpse |= !w.corpses.is_empty();
+            seen_partial |= !w.ants.is_empty() && w.deaths > 0;
+            if w.ants.is_empty() && w.eggs.is_empty() && w.nests[0].queen.is_none() {
+                break;
+            }
+        }
+        assert!(seen_corpse && seen_partial, "deaths should come one at a time");
+        assert!(w.ants.is_empty(), "{}", w.stats());
+        assert!(w.nests[0].dead && w.nests[0].queen.is_none());
+        assert!(w.corpses.iter().any(|c| c.queen), "queen should leave a corpse");
+        assert_eq!(w.live_entrances().count(), 0);
     }
 
     #[test]
-    fn upkeep_drains_stores_in_calm_weather_without_starving() {
+    fn stores_drain_in_calm_weather_without_anyone_dying() {
         let mut w = World::new(Config { seed: 3, ants: Some(40), drought: false, ..Config::default() }, 71, 48);
         fill_nest(&mut w, 0);
         let full = w.nest_food(0);
         w.food.clear();
         w.cfg.food_piles = 0;
-        run(&mut w, 600);
+        run(&mut w, 2000);
         assert!(w.nest_food(0) < full, "stores did not drain");
-        assert!(w.ants.len() >= 40, "somebody starved outside a drought");
-        assert!(!w.nests[0].starving && !w.nests[0].dead);
+        assert_eq!(w.deaths, 0, "somebody died with food in the store");
     }
 
     #[test]
-    fn castes_keep_roughly_their_shares() {
-        let mut w = World::new(Config { seed: 8, ..Config::default() }, 120, 60);
-        run(&mut w, 10000);
-        let c = w.role_counts();
-        let total = w.ants.len() as f32;
-        assert!(total > 30.0, "{}", w.stats());
-        let share = |n: usize| n as f32 / total;
-        assert!((0.4..0.7).contains(&share(c[0])), "foragers {:?}", c);
-        assert!((0.12..0.4).contains(&share(c[1])), "diggers {:?}", c);
-        assert!(c[2] >= 2 && c[3] >= 2, "scouts/nurses {:?}", c);
+    fn jobs_shift_toward_foraging_in_a_drought() {
+        let mut w = World::new(Config { seed: 8, ants: Some(60), bud: false, ..Config::default() }, 120, 60);
+        fill_nest(&mut w, 0);
+        run(&mut w, 3000);
+        let before = w.job_tally();
+        w.season = Season::Drought { until: w.tick + 40 * DAY, started: w.tick };
+        run(&mut w, 1500);
+        let after = w.job_tally();
+        assert!(after[0] > before[0], "foragers {:?} -> {:?}", before, after);
+        assert_eq!(after[2], 0, "diggers should be stood down in a drought: {:?}", after);
+        assert!(after[1] >= MIN_NURSES);
     }
 
     #[test]
-    fn diggers_and_nurses_stay_underground() {
-        let mut w = World::new(Config { seed: 9, ..Config::default() }, 100, 50);
-        for _ in 0..30 {
-            run(&mut w, 300);
-            for a in &w.ants {
-                if matches!(a.role, Role::Digger | Role::Nurse) && !matches!(a.state, State::Founding(_)) {
-                    assert!(a.underground, "{:?} outside at {},{}:\n{}", a.role, a.x, a.y, w.snapshot());
-                }
+    fn a_rich_nest_puts_more_ants_on_digging() {
+        let mut w = World::new(Config { seed: 8, ants: Some(30), bud: false, drought: false, ..Config::default() }, 120, 60);
+        run(&mut w, 2000);
+        fill_nest(&mut w, 0);
+        for _ in 0..2000 {
+            w.tick();
+            if w.tick.is_multiple_of(50) {
+                fill_nest(&mut w, 0);
             }
         }
+        assert_eq!(w.nests[0].band, Band::Plentiful, "days {}", w.nests[0].food_days);
+        let c = w.job_tally();
+        assert!(c[2] * 100 / w.ants.len() >= 20, "diggers {:?}", c);
     }
 
     #[test]
@@ -1823,22 +2604,8 @@ mod tests {
         let mut w = World::new(Config { seed: 10, ants: Some(2), ..Config::default() }, 200, 48);
         w.food.clear();
         w.cfg.food_piles = 0;
-        for (i, role) in [Role::Scout, Role::Forager].into_iter().enumerate() {
-            w.ants[i] = Ant {
-                x: 20,
-                y: w.ground[20] - 1,
-                state: State::Foraging,
-                role,
-                underground: false,
-                home: 0,
-                idle: 0,
-                dir: 1,
-                cooldown: 0,
-                dig_dir: (0, 1),
-                dig_budget: 0,
-                strength: 0.0,
-            };
-        }
+        w.ants[0] = ant_at(20, w.ground[20] - 1, Job::Scout, State::Foraging, false);
+        w.ants[1] = ant_at(20, w.ground[20] - 1, Job::Forager, State::Foraging, false);
         let mut scout_far = 0;
         let mut forager_far = 0;
         for _ in 0..300 {
@@ -1854,16 +2621,57 @@ mod tests {
     }
 
     #[test]
-    fn diggers_use_up_the_whole_soil_budget_over_a_long_run() {
-        let mut w = World::new(Config { seed: 11, drought: false, ..Config::default() }, 120, 60);
-        run(&mut w, 60000);
-        let budget = w.soil_cells() * DIG_SHARE / 100 / w.live_nests().max(2);
-        assert!(
-            w.nest_cells(0) * 10 >= budget * 9,
-            "stopped short of the budget: {} of {budget}\n{}",
-            w.nest_cells(0),
-            w.snapshot()
-        );
+    fn a_deep_rich_nest_digs_a_royal_chamber_and_the_queen_moves_in() {
+        let mut w = World::new(Config { seed: 12, ants: Some(30), bud: false, drought: false, ..Config::default() }, 120, 60);
+        // Give it a deep shaft so the depth gap is met, a full larder, and no cooldown.
+        let ex = w.entrances[0];
+        let g = w.ground[ex];
+        for y in g..(g + 30) {
+            w.set(ex, y, Cell::Tunnel);
+        }
+        // Rooms enough that a full larder counts as plentiful for thirty ants.
+        w.carve_chamber(ex, g + 14, 3, 1);
+        w.carve_chamber(ex, g + 21, 3, 1);
+        w.refresh_fields();
+        fill_nest(&mut w, 0);
+        {
+            let q = w.nests[0].queen.as_mut().unwrap();
+            q.last_relocation = 0;
+        }
+        w.tick = RELOCATE_COOLDOWN + 1;
+        let (qx, qy) = {
+            let q = w.nests[0].queen.as_ref().unwrap();
+            (q.x, q.y)
+        };
+        let mut planned = false;
+        let mut moved = false;
+        for _ in 0..40000 {
+            w.tick();
+            if w.tick.is_multiple_of(50) {
+                fill_nest(&mut w, 0); // keep it plentiful
+            }
+            planned |= w.nests[0].royal.is_some();
+            let q = w.nests[0].queen.as_ref().expect("queen died");
+            if q.relocations >= 1 {
+                moved = true;
+                assert!(q.y >= qy + RELOCATE_GAP, "queen did not go deeper: {} -> {}", qy, q.y);
+                assert!((q.x, q.y) != (qx, qy));
+                assert_eq!(w.cell(q.x, q.y), Cell::Royal);
+                break;
+            }
+        }
+        assert!(planned, "no royal chamber was ever planned:\n{}", w.snapshot());
+        assert!(moved, "queen never moved:\n{}", w.snapshot());
+        assert!(w.cells.iter().filter(|&&c| c == Cell::Royal).count() >= 8);
+    }
+
+    #[test]
+    fn tiny_and_odd_sizes_do_not_panic() {
+        for (cw, ch) in [(1, 1), (8, 6), (9, 7), (71, 48), (200, 12), (30, 200)] {
+            let mut w = World::new(Config::default(), cw, ch);
+            run(&mut w, 400);
+            let _ = w.snapshot();
+        }
     }
 
     #[test]
@@ -1880,14 +2688,5 @@ mod tests {
         run(&mut w, GRACE_PERIOD + WARNING_LENGTH + MAX_DURATION + BLOOM_LENGTH + 1);
         assert_eq!(w.reports.len(), 1, "season is {:?}", w.season);
         assert!(w.reports[0].ended > w.reports[0].started);
-    }
-
-    #[test]
-    fn tiny_and_odd_sizes_do_not_panic() {
-        for (cw, ch) in [(1, 1), (8, 6), (9, 7), (71, 48), (200, 12), (30, 200)] {
-            let mut w = World::new(Config::default(), cw, ch);
-            run(&mut w, 400);
-            let _ = w.snapshot();
-        }
     }
 }

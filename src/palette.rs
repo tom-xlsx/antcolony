@@ -37,3 +37,11 @@ pub fn shade(c: Rgb, delta: i16) -> Rgb {
     let f = |v: u8| (v as i16 + delta).clamp(0, 255) as u8;
     (f(c.0), f(c.1), f(c.2))
 }
+// Queen, eggs, corpses, royal chamber.
+pub const QUEEN: Rgb = (255, 222, 120);
+pub const QUEEN_MOVING: Rgb = (255, 240, 180);
+pub const EGG: Rgb = (232, 228, 196);
+pub const CORPSE: Rgb = (96, 82, 74);
+pub const ROYAL: Rgb = (74, 52, 34);
+pub const ROYAL_PLAN: Rgb = (112, 84, 50);
+pub const ANT_STARVING: Rgb = (150, 50, 50);

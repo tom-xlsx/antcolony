@@ -30,21 +30,54 @@ Nothing to configure. Drop it in a zellij or tmux pane and leave it running.
 #######.###ooooooo###.#####%%%%%%%#############.##############
 ```
 
-(Text snapshot from `--headless`: `.` tunnel, `o` chamber, `%` stored food, `f d s n` ants by
-caste. The real thing is in colour.)
+(Text snapshot from `--headless`: `.` tunnel, `o` room, `%` stored food, `R` royal chamber,
+`Q` queen, `e` egg, `+` corpse, `f n d s` ants by job, `x` a starving one. The real thing is
+in colour.)
 
-## Castes
+## The queen, jobs and hunger
 
-Every ant is born into a trade, and a nest keeps its castes near a fixed mix.
+Every nest has one queen. She starts in the first room the nest digs, never leaves it except
+once or twice in her life, and every so often lays an egg if she is well fed and the larder
+would see the nest through twelve days of drought; the egg hatches into a worker a few
+hundred ticks later. That is the only way the world gains ants. If she
+dies the nest is doomed: no more eggs, and the workers walk off to join the nearest nest that
+still has a queen. Her corpse lies in the chamber for a while.
 
-| Caste | Share | Colour | Does |
+Workers have jobs, not castes. A job is reassigned when the nest's larder changes, one ant at
+a time so you can watch the workforce pivot.
+
+| Job | Colour | Does |
+|---|---|---|
+| Forager | ivory | works the surface near home, follows trails, hauls food (green while carrying) |
+| Nurse | pink | keeps to the rooms, feeds the queen and hungry diggers, minds the stores |
+| Digger | tan | extends tunnels and rooms; digs the royal chamber when the nest is ready |
+| Scout | pale blue | ranges the whole surface, sees further, lays the strong trail, leads founding parties (orange on the march) |
+
+| Larder | forager | nurse | digger |
 |---|---|---|---|
-| Forager | 60% | ivory | works the surface near home, follows trails, hauls food (green while carrying) |
-| Digger | 20% | tan | lives underground extending tunnels and carving chambers |
-| Scout | 10% | pale blue | ranges the whole surface, sees further, lays the strong trail that brings foragers, leads founding parties (orange on the march) |
-| Nurse | 10% | pink | keeps to the chambers minding the stores |
+| plentiful | 40% | 30% | 30% |
+| normal | 60% | 30% | 10% |
+| scarce, or any drought | 85% | 15% | 0% |
 
-The status line shows the counts as `f66 d30 s12 n12`.
+Scouts take a tenth of the forager share. "Plentiful" means the store would last more than
+fifteen days of drought; "scarce" fewer than five. A nest that has no queen yet puts everyone
+on digging until its first room is open.
+
+Every ant has a belly. Foragers eat on the surface or at the store, nurses from the rooms they
+stand in, diggers and the queen are fed by nurses or, if nobody comes, walk to the larder.
+Hunger runs six times faster in a drought. An ant that runs empty drops its job and its load,
+goes dim, then dark red, and dies: on the surface after a few steps, underground on reaching
+a room. Corpses lie where they fell and fade. The queen carries a much larger reserve, so in a
+bad drought the workers go before she does; if it goes on long enough she stops laying, then
+starves too.
+
+Once a nest is deep and its larder plentiful, a few diggers open a royal chamber near the
+bottom, about twice the size of a room and in a warmer shade while it is being dug. When it
+is open the queen walks down to it, slowly, nurses trailing, and settles there. She moves at
+most twice, and the nest keeps digging below her.
+
+The status line shows the jobs as `f66 n12 d30 s12`, the egg count, and nest flags such as
+`1 queenless`, `1 digging royal`, `1 moving`.
 
 ## Install
 
@@ -98,19 +131,12 @@ is hollow. On the surface a one-dimensional trail of pheromone leads foragers to
 
 A nest is one connected tunnel system. Each living nest may hollow out a share of the soil
 (two-fifths of it between them; a lone nest gets a fifth), so diggers work until that is used
-and then idle in the tunnels. Workers eat a little from the chambers all year round
-and four times as much in a drought, so stores only build when foraging outpaces eating. A nest
-grows one worker at a time, and only once it holds a reserve for the workers it already has,
-so stockpiles come before mouths; that is the only way the world gains ants. In a drought a
-nest with nothing left loses a worker every half day until the drought ends or nobody is left.
-Tuned so that, on a 120×40 pane, restocking after a drought takes about a hundred days of the
-hundred and twenty between droughts, and roughly a third of droughts arrive before it is done. The status line shows `DRY SPELL`,
-`DROUGHT day 14/21` and `BLOOM`, and counts starving and dead nests. All the knobs (day
-length, drought spacing and length, consumption, starvation, spawn threshold) are constants
-at the top of `src/sim.rs`; `--headless 120000 --report` is the tuning loop.
+and then idle in the tunnels. Food goes into rooms; every ant eats from it; the queen turns a
+full belly into eggs. Tuned so that on a 120×40 pane most droughts kill a nest or two and
+none wipe the farm, and restocking takes a good part of the gap between droughts.
 
-Future hooks, deliberately not built: a queen replacing the growth rule, brood and castes,
-raiding between nests, dormancy during droughts.
+Future hooks, deliberately not built: brood as entities, soldiers and raiding, a replaceable
+queen, corpses as food or disease, a second relocation that must also be bigger.
 
 `src/sim.rs` is the simulation and has no terminal code in it. `src/ui.rs` paints a world into a
 ratatui buffer. `src/main.rs` is the event loop and flags.

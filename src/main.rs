@@ -115,6 +115,9 @@ fn main() -> io::Result<()> {
         }
         print!("{}", world.snapshot());
         println!("{}", world.stats());
+        for line in world.nest_lines() {
+            println!("{line}");
+        }
         if args.report {
             for r in &world.reports {
                 let rebuilt = match r.rebuilt_days {
@@ -166,10 +169,11 @@ impl App {
         }
         let w = &self.world;
         let mut s = format!(
-            "{} · ants {} · {} · stored {} · food {} · x{} ",
+            "{} · ants {} · {} · eggs {} · stored {} · food {} · x{} ",
             w.nest_summary(),
             w.ants.len(),
-            w.caste_summary(),
+            w.job_summary(),
+            w.eggs.len(),
             w.stored(),
             w.food.len(),
             self.speed
