@@ -2652,6 +2652,20 @@ impl World {
         };
     }
 
+    /// Hurry the weather along, for watching: from calm or cooldown start a dry spell
+    /// now; during a dry spell start the drought now; during a drought end it now.
+    pub fn force_weather(&mut self) {
+        let t = self.tick;
+        self.season = match self.season {
+            Season::Calm { .. } | Season::Cooldown { .. } | Season::Bloom { .. } => Season::Warning { until: t + WARNING_LENGTH },
+            Season::Warning { .. } => Season::Warning { until: t },
+            Season::Drought { started, .. } => Season::Drought { until: t, started },
+        };
+        if !self.cfg.drought {
+            self.cfg.drought = true; // --no-drought is overridden by asking for one
+        }
+    }
+
     /// Multiplier on the surface food spawn rate: 1 normally, tapering to 0 through the
     /// warning, 0 in drought, boosted in bloom.
     fn food_spawn_factor(&self) -> f32 {
@@ -3512,6 +3526,21 @@ mod tests {
         assert_eq!(w.stored(), 0);
         assert!(w.eggs.is_empty());
         assert!(w.ants.iter().all(|a| !a.underground), "an ant is buried alive in the soil");
+    }
+
+    #[test]
+    fn forcing_the_weather_steps_through_dry_spell_drought_and_bloom() {
+        let mut w = World::new(Config { seed: 24, ants: Some(5), ..Config::default() }, 71, 48);
+        assert!(matches!(w.season, Season::Calm { .. }));
+        w.force_weather();
+        assert!(matches!(w.season, Season::Warning { .. }));
+        w.force_weather();
+        w.tick();
+        assert!(matches!(w.season, Season::Drought { .. }), "{:?}", w.season);
+        w.force_weather();
+        w.tick();
+        assert!(matches!(w.season, Season::Bloom { .. }), "{:?}", w.season);
+        assert_eq!(w.reports.len(), 1);
     }
 
     #[test]

@@ -25,7 +25,8 @@ use sim::{Config, World};
 
 /// An ant colony that lives in a terminal pane.
 ///
-/// Keys: q quit · space pause · r reset · + / - speed · f drop food · h status line.
+/// Keys: q quit · space pause · r reset · + / - speed · f drop food · h status line ·
+/// d hurry the weather (dry spell now, then drought now, then end it).
 /// Click anywhere to drop food on the surface at that column.
 #[derive(Parser, Debug)]
 #[command(version, about, verbatim_doc_comment)]
@@ -388,6 +389,7 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
                     let x = fastrand::usize(..app.world.w);
                     app.world.add_food_at(x);
                 }
+                KeyCode::Char('d') => app.world.force_weather(),
                 _ => {}
             },
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {

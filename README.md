@@ -109,6 +109,7 @@ That puts `antcolony` in `~/.cargo/bin`.
 | `r` | reset with a new seed |
 | `+` `-` | faster / slower (1 to 8) |
 | `f` | drop a food pile somewhere on the surface |
+| `d` | hurry the weather: a dry spell now; pressed again, the drought now; again, end it |
 | `h` | hide or show the status line |
 | left click | drop a food pile on the surface at that column |
 
