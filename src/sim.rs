@@ -484,7 +484,7 @@ impl World {
         for d in 0..depth {
             world.set(ex, sky + d, Cell::Tunnel);
         }
-        world.carve_chamber(ex, sky + depth, 2, 1);
+        world.carve_chamber(ex, sky + depth, 2, 1, usize::MAX);
         world.entrances.push(ex);
         world.refresh_fields();
         world.tend_queens();
@@ -1082,7 +1082,7 @@ impl World {
             self.dug += 1;
             self.set(x, g + d, Cell::Tunnel);
         }
-        self.carve_chamber(x, g + 5, 2, 1);
+        self.carve_chamber(x, g + 5, 2, 1, usize::MAX);
         self.entrances.push(x);
         self.refresh_fields();
         self.tend_queens();
@@ -1333,12 +1333,16 @@ impl World {
                     ant.dig_dir = self.pick_dig_dir(ant.dig_dir);
                 }
                 let mut done = false;
+                let standing = match self.nest_of[here] {
+                    NO_NEST => ant.home,
+                    n => n as usize,
+                };
                 for _ in 0..6 {
                     let (dx, dy) = ant.dig_dir;
                     let (nx, ny) = (ant.x as i32 + dx, ant.y as i32 + dy);
-                    if self.can_dig(ant.x, ant.y, nx, ny) {
+                    if self.can_dig(ant.x, ant.y, nx, ny, standing) {
                         let (nx, ny) = (nx as usize, ny as usize);
-                        self.dig(nx, ny, ant.x, ant.home);
+                        self.dig(nx, ny, ant.x, standing);
                         ant.x = nx;
                         ant.y = ny;
                         ant.dig_budget -= 1;
@@ -2155,9 +2159,11 @@ impl World {
         }
     }
 
-    /// Can a digger standing at (fx, fy) open (nx, ny)? Keeps a two-cell wall around
-    /// every tunnel so the farm stays legible instead of dissolving into a maze.
-    fn can_dig(&self, fx: usize, fy: usize, nx: i32, ny: i32) -> bool {
+    /// Can a digger of nest `home` standing at (fx, fy) open (nx, ny)? Keeps a two-cell
+    /// wall around every tunnel so the farm stays legible instead of dissolving into a
+    /// maze, and never lets two systems touch: only the digger's own nest's cells close
+    /// behind it are exempt from the clearance.
+    fn can_dig(&self, fx: usize, fy: usize, nx: i32, ny: i32, home: usize) -> bool {
         if nx < 1 || ny < 1 || nx >= self.w as i32 - 1 || ny >= self.h as i32 - 1 {
             return false;
         }
@@ -2176,18 +2182,23 @@ impl World {
                     continue;
                 }
                 let (ax, ay) = (ax as usize, ay as usize);
-                if ax.abs_diff(fx) <= 2 && ay.abs_diff(fy) <= 2 {
+                let j = self.idx(ax, ay);
+                if self.planned_royal(j) {
+                    return false; // leave a royal chamber's earth alone, whoever's it is
+                }
+                if !self.is_dug(ax, ay) {
+                    continue;
+                }
+                // Cells dug this tick aren't labelled yet; those right by the digger are its own.
+                let ours = self.nest_of[j] as usize == home
+                    || (self.nest_of[j] == NO_NEST && ax.abs_diff(fx) <= 1 && ay.abs_diff(fy) <= 1);
+                if ours && ax.abs_diff(fx) <= 2 && ay.abs_diff(fy) <= 2 {
                     continue; // the tunnel we came from
                 }
-                if self.cell(ax, ay).room() && ax.abs_diff(fx) <= 3 && ay.abs_diff(fy) <= 3 {
+                if ours && self.cell(ax, ay).room() && ax.abs_diff(fx) <= 3 && ay.abs_diff(fy) <= 3 {
                     continue; // our own room, when digging out of it
                 }
-                if self.is_dug(ax, ay) {
-                    return false; // husks included: they crumble away in their own time
-                }
-                if self.planned_royal(self.idx(ax, ay)) {
-                    return false; // leave the royal chamber's earth alone
-                }
+                return false; // anyone else's tunnel, a husk, or our own too close
             }
         }
         true
@@ -2207,7 +2218,7 @@ impl World {
         if depth >= min_depth && self.rng.f32() < p_room && !self.chamber_near(x, y, 5) {
             let rx = self.rng.usize(2..=3);
             let ry = self.rng.usize(1..=2);
-            self.carve_chamber(x, y, rx, ry);
+            self.carve_chamber(x, y, rx, ry, home);
         }
         self.raise_mound(from_x);
     }
@@ -2225,8 +2236,10 @@ impl World {
         false
     }
 
-    /// Hollow an ellipse around (cx, cy) where the soil allows it.
-    fn carve_chamber(&mut self, cx: usize, cy: usize, rx: usize, ry: usize) {
+    /// Hollow an ellipse around (cx, cy) where the soil allows it. Only the digging
+    /// nest's own tunnel near the centre may touch it.
+    fn carve_chamber(&mut self, cx: usize, cy: usize, rx: usize, ry: usize, home: usize) {
+        let own = home as u16;
         let mut cells = Vec::new();
         for dy in -(ry as i32)..=(ry as i32) {
             for dx in -(rx as i32)..=(rx as i32) {
@@ -2254,10 +2267,18 @@ impl World {
             for dy in -1..=1_i32 {
                 for dx in -1..=1_i32 {
                     let (ax, ay) = ((x as i32 + dx) as usize, (y as i32 + dy) as usize);
-                    if (ax.abs_diff(cx) <= 2 && ay.abs_diff(cy) <= 2) || cells.contains(&(ax, ay)) {
+                    if cells.contains(&(ax, ay)) {
                         continue;
                     }
-                    if self.is_dug(ax, ay) || self.planned_royal(self.idx(ax, ay)) {
+                    let j = self.idx(ax, ay);
+                    let near_centre = ax.abs_diff(cx) <= 2 && ay.abs_diff(cy) <= 2;
+                    // The centre was dug this tick and isn't labelled yet; unlabelled cells
+                    // next to it are the tunnel we came in by.
+                    let ours = self.nest_of[j] == own || self.nest_of[j] == NO_NEST;
+                    if self.is_dug(ax, ay) && !(ours && near_centre) {
+                        return;
+                    }
+                    if self.planned_royal(j) {
                         return;
                     }
                 }
@@ -2436,6 +2457,9 @@ impl World {
 
         let old = std::mem::take(&mut self.nests);
         let mut old_to_new = vec![usize::MAX; old.len()];
+        // A system that decay has split in two keeps its label on one piece only; the
+        // other piece becomes a nest of its own (still a husk, if it was one).
+        let mut claimed = vec![false; old.len()];
         let mut built: Vec<(usize, Nest, Vec<usize>)> = Vec::new(); // (component, nest, old matches)
         for c in 0..comps.len() {
             let ents: Vec<usize> = self
@@ -2448,9 +2472,12 @@ impl World {
                 continue;
             }
             let mut matching: Vec<usize> = (0..old.len())
-                .filter(|&i| old[i].entrances.iter().any(|e| ents.contains(e)))
+                .filter(|&i| old[i].entrances.iter().any(|e| ents.contains(e)) && !claimed[i])
                 .collect();
             matching.sort_by_key(|&i| old[i].label);
+            for &m in &matching {
+                claimed[m] = true;
+            }
             let nest = if let Some(&first) = matching.first() {
                 let mut base = old[first].clone();
                 for &m in &matching[1..] {
@@ -2481,7 +2508,13 @@ impl World {
             } else {
                 let label = (b'A' + self.next_label % 26) as char;
                 self.next_label = self.next_label.wrapping_add(1);
-                Nest::new(label, ents)
+                let mut nest = Nest::new(label, ents.clone());
+                // A piece broken off a dying nest inherits its fate.
+                if let Some(parent) = old.iter().find(|o| o.entrances.iter().any(|e| ents.contains(e))) {
+                    nest.dead = parent.dead;
+                    nest.queen_lost = parent.queen_lost;
+                }
+                nest
             };
             built.push((c, nest, matching));
         }
@@ -2891,7 +2924,7 @@ mod tests {
         for d in 0..depth {
             w.set(x, g + d, Cell::Tunnel);
         }
-        w.carve_chamber(x, g + depth, 2, 1);
+        w.carve_chamber(x, g + depth, 2, 1, usize::MAX);
         w.entrances.push(x);
         w.refresh_fields();
         w.tend_queens();
@@ -3197,8 +3230,8 @@ mod tests {
             w.set(ex, y, Cell::Tunnel);
         }
         // Rooms enough that a full larder counts as plentiful for thirty ants.
-        w.carve_chamber(ex, g + 14, 3, 1);
-        w.carve_chamber(ex, g + 21, 3, 1);
+        w.carve_chamber(ex, g + 14, 3, 1, 0);
+        w.carve_chamber(ex, g + 21, 3, 1, 0);
         w.refresh_fields();
         fill_nest(&mut w, 0);
         {
@@ -3398,7 +3431,7 @@ mod tests {
         let g = w.ground[x];
         w.set(x, g, Cell::Tunnel);
         w.set(x, g + 1, Cell::Tunnel);
-        w.carve_chamber(x, g + 3, 2, 1);
+        w.carve_chamber(x, g + 3, 2, 1, usize::MAX);
         w.entrances.push(x);
         w.refresh_fields();
         w.tend_queens();
@@ -3547,6 +3580,49 @@ mod tests {
         w.tick();
         assert!(matches!(w.season, Season::Bloom { .. }), "{:?}", w.season);
         assert_eq!(w.reports.len(), 1);
+    }
+
+    #[test]
+    fn two_busy_nests_side_by_side_never_join_up() {
+        let mut w = World::new(Config { seed: 25, ants: Some(40), bud: false, drought: false, ..Config::default() }, 90, 48);
+        dig_system(&mut w, 60, 5);
+        for _ in 0..40 {
+            w.spawn_ant(1, None);
+        }
+        w.recount_workers();
+        for n in 0..2 {
+            fill_nest(&mut w, n);
+        }
+        for a in &mut w.ants {
+            a.job = Job::Digger;
+            a.state = State::ToTip;
+        }
+        for _ in 0..30000 {
+            w.tick();
+            if w.tick.is_multiple_of(50) {
+                for n in 0..w.nests.len() {
+                    fill_nest(&mut w, n);
+                }
+            }
+            if w.tick.is_multiple_of(500) {
+                assert_eq!(w.nests.len(), 2, "the two systems joined up:\n{}", w.snapshot());
+                // No cell of one nest may touch a cell of the other.
+                for i in 0..w.cells.len() {
+                    if !w.cells[i].dug() || w.nest_of[i] == NO_NEST {
+                        continue;
+                    }
+                    let (x, y) = (i % w.w, i / w.w);
+                    for (dx, dy) in [(1, 0), (0, 1)] {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx < w.w && ny < w.h && w.is_dug(nx, ny) {
+                            let j = w.idx(nx, ny);
+                            assert_eq!(w.nest_of[j], w.nest_of[i], "nests touch at {x},{y}:\n{}", w.snapshot());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(w.nest_cells(0) > 60 && w.nest_cells(1) > 60, "they should both have dug plenty: {} {}", w.nest_cells(0), w.nest_cells(1));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "antcolony"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 description = "An ant colony that lives in a terminal pane"
 license = "MIT"
