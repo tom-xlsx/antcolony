@@ -1071,10 +1071,15 @@ impl World {
         }
         let Some(x) = x else { return };
         let g = self.ground[x];
+        let clear = (0..8).all(|d| {
+            let i = self.idx(x, g + d);
+            self.cells[i] == Cell::Soil && !self.husk_zone[i]
+        });
+        if !clear {
+            return; // try again next time round
+        }
         for d in 0..5 {
-            if self.cell(x, g + d) == Cell::Soil {
-                self.dug += 1;
-            }
+            self.dug += 1;
             self.set(x, g + d, Cell::Tunnel);
         }
         self.carve_chamber(x, g + 5, 2, 1);
@@ -1819,6 +1824,7 @@ impl World {
                 self.nests[n].queen_lost = true;
                 self.nests[n].royal = None;
                 self.queens_moved = true;
+                self.dirty = true; // the keep-out zone round her nest starts now
             }
         }
     }
@@ -3570,6 +3576,7 @@ mod tests {
         assert!(r.ants_lost <= w.deaths && r.queens_lost <= w.queen_deaths);
     }
 }
+
 
 
 

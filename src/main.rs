@@ -81,10 +81,8 @@ const FRAME: Duration = Duration::from_millis(40);
 /// How long the post-drought notice stays up.
 const NOTICE: Duration = Duration::from_secs(8);
 
-/// Collects a whole frame, then hands it to the terminal in modest chunks with a breath
-/// between them. One huge write (a full repaint is a few hundred kilobytes) can tear on
-/// the way through a multiplexer and the terminal, which shows up as striped rows and
-/// missing letters; paced out, it arrives intact.
+/// Collects a whole frame and hands it to the terminal as one synchronized update, so
+/// nothing downstream can show a half-applied frame (striped rows, missing letters).
 struct Paced {
     buf: Vec<u8>,
 }
@@ -98,15 +96,18 @@ impl Write for Paced {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
         let mut out = stdout().lock();
-        let big = self.buf.len() > 2 * CHUNK;
+        // Synchronized output (DEC 2026): the terminal holds the frame and applies it in
+        // one go, so a multiplexer can't repaint halfway through it.
+        out.write_all(b"\x1b[?2026h")?;
         for chunk in self.buf.chunks(CHUNK) {
             out.write_all(chunk)?;
-            out.flush()?;
-            if big {
-                std::thread::sleep(Duration::from_millis(2));
-            }
         }
+        out.write_all(b"\x1b[?2026l")?;
+        out.flush()?;
         self.buf.clear();
         Ok(())
     }
