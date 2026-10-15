@@ -20,6 +20,31 @@ pub struct Colony<'a> {
     /// the new weather arrives cell by cell instead.
     pub fading_from: Option<Season>,
     pub fade: f32,
+    /// Label of the nest being followed: its ants stay bright, everyone else goes dim.
+    pub follow: Option<char>,
+}
+
+/// Swatches and names for the legend (`j`).
+pub fn legend() -> Vec<(Rgb, &'static str)> {
+    vec![
+        (palette::ANT, "forager"),
+        (palette::ANT_NURSE, "nurse"),
+        (palette::ANT_DIGGING, "digger"),
+        (palette::ANT_SCOUT, "scout"),
+        (palette::ANT_CARRYING, "carrying food"),
+        (palette::ANT_FOUNDING, "off to found a nest"),
+        (palette::lerp(palette::ANT, palette::TUNNEL, 0.45), "hungry (any job, dimmed)"),
+        (palette::ANT_STARVING, "starving"),
+        (palette::QUEEN, "queen (two cells wide)"),
+        (palette::EGG, "egg"),
+        (palette::CORPSE, "corpse"),
+        (palette::FOOD, "food pile; rooms go this green as they fill"),
+        (palette::ROYAL, "queen's chamber"),
+        (palette::ROYAL_OUTLINE, "outline left by a queen's chamber"),
+        (palette::ROYAL_PLAN, "hall being dug for the queen"),
+        (palette::ABANDONED, "tunnels of a dead nest"),
+        (palette::TRAIL, "foraging trail on the surface"),
+    ]
 }
 
 /// Which tint a season uses; seasons with the same key look identical.
@@ -72,7 +97,7 @@ fn weather(season: Season) -> Weather {
 }
 
 /// Flat RGB pixel buffer the size of the world.
-pub fn paint(world: &World, fading_from: Option<Season>, fade: f32) -> Vec<Rgb> {
+pub fn paint(world: &World, fading_from: Option<Season>, fade: f32, follow: Option<char>) -> Vec<Rgb> {
     let (w, h) = (world.w, world.h);
     let wx_new = weather(world.season);
     let wx_old = fading_from.map(weather);
@@ -190,6 +215,11 @@ pub fn paint(world: &World, fading_from: Option<Season>, fade: f32) -> Vec<Rgb> 
         }
     }
 
+    let followed = follow.and_then(|l| world.nests.iter().position(|n| n.label == l));
+    let dim = |c: Rgb, home: usize| match followed {
+        Some(f) if f != home => palette::lerp(c, palette::TUNNEL, 0.6),
+        _ => c,
+    };
     for ant in &world.ants {
         if ant.x < w && ant.y < h {
             let base = match (ant.state, ant.job) {
@@ -202,18 +232,19 @@ pub fn paint(world: &World, fading_from: Option<Season>, fade: f32) -> Vec<Rgb> 
                 (_, Job::Nurse) => palette::ANT_NURSE,
             };
             // Hungry ants go dim.
-            px[ant.y * w + ant.x] = if ant.fed < HUNGRY && ant.state != State::Starving {
+            let c = if ant.fed < HUNGRY && ant.state != State::Starving {
                 palette::lerp(base, palette::TUNNEL, 0.45)
             } else {
                 base
             };
+            px[ant.y * w + ant.x] = dim(c, ant.home);
         }
     }
 
     // The queen is two pixels wide and never dimmed; her second pixel fills a dug cell.
-    for nest in &world.nests {
+    for (n, nest) in world.nests.iter().enumerate() {
         if let Some(q) = &nest.queen {
-            let c = if q.relocating { palette::QUEEN_MOVING } else { palette::QUEEN };
+            let c = dim(if q.relocating { palette::QUEEN_MOVING } else { palette::QUEEN }, n);
             px[q.y * w + q.x] = c;
             if q.x + 1 < w && world.cell(q.x + 1, q.y).dug() {
                 px[q.y * w + q.x + 1] = c;
@@ -233,7 +264,7 @@ impl Widget for Colony<'_> {
             return;
         }
         let world = self.world;
-        let px = paint(world, self.fading_from, self.fade);
+        let px = paint(world, self.fading_from, self.fade, self.follow);
         let cols = (area.width as usize).min(world.w);
         let rows = (area.height as usize).min(world.h / 2);
         for cy in 0..rows {

@@ -109,9 +109,23 @@ That puts `antcolony` in `~/.cargo/bin`.
 | `r` | reset with a new seed |
 | `+` `-` | faster / slower (1 to 8) |
 | `f` | drop a food pile somewhere on the surface |
-| `d` | hurry the weather: a dry spell now; pressed again, the drought now; again, end it |
 | `h` | hide or show the status line |
+| `?` | help box with these keys |
+| `j` | legend: which colour is a nurse, a scout, an egg, a corpse |
 | left click | drop a food pile on the surface at that column |
+| point at a nest | a line about it: ants by job, how the queen is doing, days of food |
+
+### Tapping the glass
+
+| Key | Does |
+|---|---|
+| `d` | hurry the weather: a dry spell now; pressed again, the drought now; again, end it |
+| `w` | rain: a bloom starts now (or the drought ends now), and two piles land at once |
+| `t` | tap the glass: every ant jolts a cell sideways and stands dazed for a moment |
+| `T` | quake: a few stretches of ceiling fall in and fill tunnels and rooms. Ants underneath scramble clear or are buried. No fall ever cuts a nest off from its entrance or buries a queen |
+| `k` | the biggest nest loses its queen, so you can watch the nest decay |
+| `1` to `9` | follow a nest: its ants stay bright and everyone else goes dim. Numbers count living nests in order; the same number again, or `0`, stops |
+| `s` | save a text snapshot of the farm (`antcolony-<tick>.txt` in the current directory) |
 
 Resizing the pane starts a fresh colony at the new size.
 

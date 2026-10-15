@@ -424,6 +424,11 @@ const MAX_DURATION: u64 = 40 * DAY;
 const COOLDOWN: u64 = 20 * DAY;
 const BLOOM_LENGTH: u64 = 10 * DAY;
 const BLOOM_MULTIPLIER: u32 = 3;
+// Tapping the glass.
+/// Ticks an ant stands dazed after a tremor or a fall.
+const DAZE: u8 = 12;
+/// Stretches of ceiling that give way in a quake.
+const QUAKE_FALLS: usize = 4;
 
 impl World {
     pub fn new(cfg: Config, w: usize, h: usize) -> Self {
@@ -1821,16 +1826,20 @@ impl World {
             let Some(q) = self.nests[n].queen.as_mut() else { continue };
             q.fed -= QUEEN_CONSUME * rate;
             if q.fed <= 0.0 {
-                let (x, y) = (q.x, q.y);
-                self.corpses.push(Corpse { x, y, queen: true, ttl: QUEEN_CORPSE_DECAY, max_ttl: QUEEN_CORPSE_DECAY });
-                self.queen_deaths += 1;
-                self.nests[n].queen = None;
-                self.nests[n].queen_lost = true;
-                self.nests[n].royal = None;
-                self.queens_moved = true;
-                self.dirty = true; // the keep-out zone round her nest starts now
+                self.queen_dies(n);
             }
         }
+    }
+
+    /// The queen of nest `n` dies where she stands; her line is finished.
+    fn queen_dies(&mut self, n: usize) {
+        let Some(q) = self.nests[n].queen.take() else { return };
+        self.corpses.push(Corpse { x: q.x, y: q.y, queen: true, ttl: QUEEN_CORPSE_DECAY, max_ttl: QUEEN_CORPSE_DECAY });
+        self.queen_deaths += 1;
+        self.nests[n].queen_lost = true;
+        self.nests[n].royal = None;
+        self.queens_moved = true;
+        self.dirty = true; // the keep-out zone round her nest starts now
     }
 
     /// Make the room around (x, y) the queen's chamber: its cells become royal and the
@@ -2703,6 +2712,232 @@ impl World {
         if !self.cfg.drought {
             self.cfg.drought = true; // --no-drought is overridden by asking for one
         }
+    }
+
+    // ---- tapping the glass ------------------------------------------------------------
+
+    /// Rain, for watching: a bloom starts now (in a drought, the drought ends now and the
+    /// bloom follows), and a couple of piles land on the surface at once.
+    pub fn water(&mut self) {
+        let t = self.tick;
+        if self.cfg.drought {
+            self.season = match self.season {
+                Season::Drought { started, .. } => Season::Drought { until: t, started },
+                _ => Season::Bloom { until: t + BLOOM_LENGTH },
+            };
+        }
+        for _ in 0..2 {
+            self.spawn_food(1.5);
+        }
+    }
+
+    /// A tap on the glass: every ant is jolted a cell to one side and stands dazed a moment.
+    pub fn tremor(&mut self) {
+        for i in 0..self.ants.len() {
+            let (x, y, under) = (self.ants[i].x, self.ants[i].y, self.ants[i].underground);
+            let dir: i32 = if self.rng.bool() { 1 } else { -1 };
+            let side = x as i32 + dir;
+            let side = (side >= 0 && side < self.w as i32).then_some(side as usize);
+            let mut to = Vec::with_capacity(3);
+            if under {
+                if let Some(sx) = side {
+                    if self.is_dug(sx, y) {
+                        to.push((sx, y));
+                    }
+                }
+                if y > 0 && self.is_dug(x, y - 1) {
+                    to.push((x, y - 1));
+                }
+                if y + 1 < self.h && self.is_dug(x, y + 1) {
+                    to.push((x, y + 1));
+                }
+            } else if let Some(sx) = side {
+                to.push((sx, self.ground[sx] - 1));
+            }
+            if !to.is_empty() {
+                let (nx, ny) = to[self.rng.usize(..to.len())];
+                self.ants[i].x = nx;
+                self.ants[i].y = ny;
+                if !under {
+                    self.ants[i].dir = dir;
+                }
+            }
+            self.ants[i].cooldown = DAZE;
+        }
+    }
+
+    /// A hard knock on the glass: a few stretches of ceiling give way and tunnels fill
+    /// with soil. Ants underneath scramble clear or are buried. No cell goes if losing it
+    /// would cut a nest off from its entrance, and the queen and her hall are never buried.
+    /// Returns the number of cells filled.
+    pub fn quake(&mut self) -> usize {
+        let mut filled = 0;
+        let mut candidates: Vec<usize> = (0..self.cells.len())
+            .filter(|&j| {
+                let (x, y) = (j % self.w, j / self.w);
+                y >= self.ground[x] + 3 && self.cells[j].dug() && self.cells[j] != Cell::Royal && !self.queen_on(j)
+            })
+            .collect();
+        self.rng.shuffle(&mut candidates);
+        for &start in candidates.iter().take(QUAKE_FALLS * 8) {
+            if filled >= QUAKE_FALLS * 6 {
+                break;
+            }
+            let (cx, cy) = (start % self.w, start / self.w);
+            // The fall is a stretch three wide and two deep, but each cell only goes if
+            // the nest stays in one piece without it.
+            let mut blob = Vec::new();
+            for dy in 0..2_usize {
+                for dx in -1..=1_i32 {
+                    let (nx, ny) = (cx as i32 + dx, cy + dy);
+                    if nx < 0 || nx >= self.w as i32 || ny >= self.h {
+                        continue;
+                    }
+                    let j = self.idx(nx as usize, ny);
+                    if self.cells[j].dug() && self.cells[j] != Cell::Royal && !self.queen_on(j) {
+                        let was = self.cells[j];
+                        self.cells[j] = Cell::Soil;
+                        if self.severed(&[j]) {
+                            self.cells[j] = was;
+                        } else {
+                            blob.push(j);
+                        }
+                    }
+                }
+            }
+            if blob.is_empty() {
+                continue;
+            }
+            for &j in &blob {
+                self.store[j] = 0;
+                self.traffic[j] = 0;
+                self.widened[j] = false;
+                self.dead_tip[j] = false;
+            }
+            for nest in &mut self.nests {
+                if nest.royal.as_ref().is_some_and(|r| r.all.iter().any(|c| blob.contains(c))) {
+                    nest.royal = None; // the hall they were digging is gone
+                }
+            }
+            self.eggs.retain(|e| !blob.contains(&e.cell));
+            let mut i = 0;
+            while i < self.ants.len() {
+                let a = &self.ants[i];
+                let here = self.idx(a.x, a.y);
+                if !a.underground || !blob.contains(&here) {
+                    i += 1;
+                    continue;
+                }
+                match self.open_cell_near(a.x, a.y, a.home) {
+                    Some((nx, ny)) => {
+                        self.ants[i].x = nx;
+                        self.ants[i].y = ny;
+                        self.ants[i].cooldown = DAZE;
+                        i += 1;
+                    }
+                    None => {
+                        self.ants.swap_remove(i); // buried where she stood
+                        self.deaths += 1;
+                    }
+                }
+            }
+            filled += blob.len();
+            self.dirty = true;
+        }
+        filled
+    }
+
+    fn queen_on(&self, i: usize) -> bool {
+        let (x, y) = (i % self.w, i / self.w);
+        self.nests.iter().any(|n| n.queen.as_ref().is_some_and(|q| q.y == y && (q.x == x || q.x + 1 == x)))
+    }
+
+    /// Would any nest that owned these (now filled) cells be left with a piece cut off
+    /// from its entrances?
+    fn severed(&self, blob: &[usize]) -> bool {
+        let mut owners: Vec<u16> = blob.iter().map(|&j| self.nest_of[j]).filter(|&n| n != NO_NEST).collect();
+        owners.sort_unstable();
+        owners.dedup();
+        owners.into_iter().any(|n| {
+            let sources: Vec<usize> = self.nests[n as usize].entrances.iter().map(|&x| self.idx(x, self.ground[x])).collect();
+            let dist = self.bfs(&sources);
+            (0..self.cells.len()).any(|j| self.nest_of[j] == n && self.cells[j].dug() && dist[j] == FAR)
+        })
+    }
+
+    /// The nearest open cell of nest `home` within two of (x, y), for an ant scrambling
+    /// out from under a fall.
+    fn open_cell_near(&self, x: usize, y: usize, home: usize) -> Option<(usize, usize)> {
+        for r in 1..=2_i32 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= self.w as i32 || ny >= self.h as i32 {
+                        continue;
+                    }
+                    let j = self.idx(nx as usize, ny as usize);
+                    if self.cells[j].dug() && self.nest_of[j] as usize == home {
+                        return Some((nx as usize, ny as usize));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Kill the queen of the biggest living nest, for watching a nest decay. Returns the
+    /// nest's label, or `None` if no nest has a queen.
+    pub fn kill_queen(&mut self) -> Option<char> {
+        let n = (0..self.nests.len())
+            .filter(|&n| !self.nests[n].dead && self.nests[n].queen.is_some())
+            .max_by_key(|&n| self.nests[n].workers)?;
+        self.queen_dies(n);
+        Some(self.nests[n].label)
+    }
+
+    /// Labels of the living nests in order, for the follow keys.
+    pub fn live_nest_labels(&self) -> Vec<char> {
+        self.nests.iter().filter(|n| !n.dead).map(|n| n.label).collect()
+    }
+
+    /// The nest a world cell belongs to, if any.
+    pub fn nest_at(&self, x: usize, y: usize) -> Option<usize> {
+        if x >= self.w || y >= self.h {
+            return None;
+        }
+        let n = self.nest_of[self.idx(x, y)];
+        (n != NO_NEST).then_some(n as usize)
+    }
+
+    /// One line about a nest, for the tooltip.
+    pub fn nest_detail(&self, n: usize) -> String {
+        let nest = &self.nests[n];
+        if nest.dead {
+            return format!("nest {} · dead, crumbling away", nest.label);
+        }
+        let c = self.job_counts(n);
+        let queen = match &nest.queen {
+            Some(q) if q.relocating => "queen moving house".to_string(),
+            Some(q) => format!("queen fed {:.0}%", q.fed / QUEEN_FED_MAX * 100.0),
+            None if nest.queen_lost => "queen dead".to_string(),
+            None => "no queen yet".to_string(),
+        };
+        let band = match nest.band {
+            Band::Plentiful => "plentiful",
+            Band::Normal => "normal",
+            Band::Scarce => "scarce",
+        };
+        format!(
+            "nest {} · {} ants (f{} n{} d{} s{}) · {queen} · food {} ({band}, {:.0} days)",
+            nest.label,
+            nest.workers,
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            self.nest_food(n),
+            nest.food_days
+        )
     }
 
     /// Multiplier on the surface food spawn rate: 1 normally, tapering to 0 through the
@@ -3580,6 +3815,85 @@ mod tests {
         w.tick();
         assert!(matches!(w.season, Season::Bloom { .. }), "{:?}", w.season);
         assert_eq!(w.reports.len(), 1);
+    }
+
+    #[test]
+    fn watering_brings_a_bloom_and_food_at_once() {
+        let mut w = World::new(Config { seed: 30, ants: Some(5), ..Config::default() }, 71, 48);
+        let before = w.food.len();
+        w.water();
+        assert!(matches!(w.season, Season::Bloom { .. }), "{:?}", w.season);
+        assert_eq!(w.food.len(), before + 2);
+        w.force_weather();
+        w.force_weather();
+        w.tick();
+        assert!(matches!(w.season, Season::Drought { .. }), "{:?}", w.season);
+        w.water();
+        w.tick();
+        assert!(matches!(w.season, Season::Bloom { .. }), "rain should end a drought: {:?}", w.season);
+        assert_eq!(w.reports.len(), 1);
+    }
+
+    #[test]
+    fn a_tremor_leaves_every_ant_on_walkable_ground() {
+        let mut w = world(31);
+        run(&mut w, 1500);
+        let n = w.ants.len();
+        for _ in 0..5 {
+            w.tremor();
+            for a in &w.ants {
+                if a.underground {
+                    assert!(w.is_dug(a.x, a.y), "ant shaken into soil at {},{}", a.x, a.y);
+                } else {
+                    assert_eq!(a.y, w.ground[a.x] - 1, "surface ant off the ground at {},{}", a.x, a.y);
+                }
+            }
+            run(&mut w, 50);
+        }
+        assert_eq!(w.ants.len(), n, "a tremor should not kill anyone");
+    }
+
+    #[test]
+    fn a_quake_fills_tunnels_without_cutting_a_nest_off() {
+        let mut w = world(32);
+        run(&mut w, 1500);
+        let dug_before = w.cells.iter().filter(|c| c.dug()).count();
+        let labels_before = w.nests.len();
+        let queens_before = w.nests.iter().filter(|n| n.queen.is_some()).count();
+        let mut filled = 0;
+        for _ in 0..10 {
+            filled += w.quake();
+            if filled > 0 {
+                break;
+            }
+        }
+        assert!(filled > 0, "no ceiling ever gave way:\n{}", w.snapshot());
+        w.tick();
+        let dug_after = w.cells.iter().filter(|c| c.dug()).count();
+        assert!(dug_after < dug_before, "nothing filled in");
+        assert_eq!(w.nests.len(), labels_before, "a fall cut a nest in two:\n{}", w.snapshot());
+        assert_eq!(w.nests.iter().filter(|n| n.queen.is_some()).count(), queens_before, "a queen was buried");
+        for a in &w.ants {
+            if a.underground {
+                assert!(w.is_dug(a.x, a.y), "ant left inside the soil at {},{}", a.x, a.y);
+            }
+        }
+    }
+
+    #[test]
+    fn killing_the_queen_starts_the_decay() {
+        let mut w = world(33);
+        run(&mut w, 3000);
+        let label = w.kill_queen().expect("there is a queen to kill");
+        let n = w.nests.iter().position(|n| n.label == label).unwrap();
+        assert!(w.nests[n].queen.is_none() && w.nests[n].queen_lost);
+        assert!(w.corpses.iter().any(|c| c.queen));
+        assert_eq!(w.kill_queen(), None, "only one queen on this farm");
+        let cells = w.nest_cells(n);
+        run(&mut w, 3000);
+        let n = w.nests.iter().position(|n| n.label == label);
+        let left = n.map(|n| w.nest_cells(n)).unwrap_or(0);
+        assert!(left < cells, "her nest should be crumbling: {cells} -> {left}");
     }
 
     #[test]

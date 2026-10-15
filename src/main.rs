@@ -17,7 +17,8 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Terminal;
 
@@ -26,8 +27,9 @@ use sim::{Config, World};
 /// An ant colony that lives in a terminal pane.
 ///
 /// Keys: q quit · space pause · r reset · + / - speed · f drop food · h status line ·
-/// d hurry the weather (dry spell now, then drought now, then end it).
-/// Click anywhere to drop food on the surface at that column.
+/// d hurry the weather · w rain · t tap the glass · T quake · k kill the biggest queen ·
+/// 1-9 follow a nest (0 stops) · s save a snapshot · j legend · ? help.
+/// Click anywhere to drop food on the surface at that column; point at a nest for its details.
 #[derive(Parser, Debug)]
 #[command(version, about, verbatim_doc_comment)]
 struct Args {
@@ -78,8 +80,9 @@ fn parse_size(s: &str) -> Result<(usize, usize), String> {
 /// Ticks per frame at each speed level (index = level - 1). Level 1 also halves the frame rate.
 const SPEEDS: [u32; 8] = [1, 1, 2, 3, 4, 6, 8, 12];
 const FRAME: Duration = Duration::from_millis(40);
-/// How long the post-drought notice stays up.
+/// How long the post-drought notice stays up, and how long a quick reply to a key does.
 const NOTICE: Duration = Duration::from_secs(8);
+const QUICK: Duration = Duration::from_secs(3);
 
 /// Collects a whole frame and hands it to the terminal as one synchronized update, so
 /// nothing downstream can show a half-applied frame (striped rows, missing letters).
@@ -202,8 +205,13 @@ struct App {
     show_status: bool,
     /// Drought reports already announced.
     reports_seen: usize,
-    /// The notice on screen and when it went up.
-    notice: Option<(Vec<String>, Instant)>,
+    /// The notice on screen, when it went up, and how long it stays.
+    notice: Option<(Vec<String>, Instant, Duration)>,
+    /// Nest label whose ants stay bright while the rest go dim.
+    follow: Option<char>,
+    /// Last mouse position, for the nest tooltip.
+    hover: Option<(u16, u16)>,
+    panel: Panel,
     /// Season tint currently shown, the one dissolving out, and the dissolve progress.
     shown_season: sim::Season,
     fading_from: Option<sim::Season>,
@@ -212,6 +220,30 @@ struct App {
 
 /// Dissolve step per frame: about two seconds for a full change of weather.
 const FADE_STEP: f32 = 0.02;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Panel {
+    None,
+    Help,
+    Legend,
+}
+
+const HELP: &[&str] = &[
+    "q        quit            space  pause",
+    "+ / -    speed           r      new colony",
+    "f        drop food       click  drop food there",
+    "d        hurry the weather (dry spell, drought, end)",
+    "w        rain: a bloom now, food at once",
+    "t        tap the glass: every ant jolts",
+    "T        quake: ceilings fall, tunnels fill",
+    "k        the biggest nest loses its queen",
+    "1 to 9   follow a nest, 0 to stop",
+    "s        save a snapshot to a text file",
+    "j        legend          h      status line",
+    "?        this box",
+    "",
+    "Point at a nest to see how it is doing.",
+];
 
 impl App {
     /// Status line, dropping the least important parts until it fits the pane.
@@ -232,6 +264,9 @@ impl App {
         ];
         if let Some(season) = w.season_label() {
             parts.push((0, season));
+        }
+        if let Some(l) = self.follow {
+            parts.push((1, format!("following {l}")));
         }
         if self.paused {
             parts.push((0, "paused".into()));
@@ -265,6 +300,7 @@ impl App {
         self.world = World::new(self.cfg.clone(), cols as usize, rows as usize * 2);
         self.reports_seen = 0;
         self.notice = None;
+        self.follow = None;
         self.shown_season = self.world.season;
         self.fading_from = None;
         self.fade = 1.0;
@@ -300,8 +336,94 @@ impl App {
         if r.nests_after < r.nests_before {
             lines.push(format!("{} of {} nests survived", r.nests_after, r.nests_before));
         }
-        self.notice = Some((lines, Instant::now()));
+        self.notice = Some((lines, Instant::now(), NOTICE));
     }
+
+    /// A one-line reply to a key press, up for a few seconds.
+    fn say(&mut self, text: String) {
+        self.notice = Some((vec![text], Instant::now(), QUICK));
+    }
+
+    /// Follow the n-th living nest (1-based); the same number again stops following.
+    fn follow_nest(&mut self, n: usize) {
+        let labels = self.world.live_nest_labels();
+        match labels.get(n.wrapping_sub(1)) {
+            Some(&l) if self.follow == Some(l) => self.follow = None,
+            Some(&l) => {
+                self.follow = Some(l);
+                self.say(format!("Following nest {l}"));
+            }
+            None => self.say(format!("No nest {n}")),
+        }
+    }
+
+    /// Write the text picture and the stats to a file in the current directory.
+    fn save_snapshot(&mut self) {
+        let name = format!("antcolony-{}.txt", self.world.tick);
+        let mut text = self.world.snapshot();
+        text.push_str(&self.world.stats());
+        text.push('\n');
+        for line in self.world.nest_lines() {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        match std::fs::write(&name, text) {
+            Ok(()) => self.say(format!("Saved {name}")),
+            Err(e) => self.say(format!("Could not save {name}: {e}")),
+        }
+    }
+
+    /// What the nest under the mouse is up to, if the mouse is over one.
+    fn tooltip(&self, area: Rect) -> Option<(u16, u16, String)> {
+        let (col, row) = self.hover?;
+        if col < area.x || row < area.y {
+            return None;
+        }
+        let (x, y) = ((col - area.x) as usize, (row - area.y) as usize * 2);
+        let n = self.world.nest_at(x, y).or_else(|| self.world.nest_at(x, y + 1))?;
+        Some((col, row, self.world.nest_detail(n)))
+    }
+}
+
+fn box_style() -> Style {
+    Style::default().fg(Color::Rgb(230, 220, 200)).bg(Color::Rgb(40, 30, 22))
+}
+
+/// A bordered box of lines in the top-left corner (help, legend).
+fn draw_panel(frame: &mut ratatui::Frame, lines: Vec<Line<'static>>) {
+    let area = frame.area();
+    let width = (lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 4).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    if width < 6 || height < 3 {
+        return;
+    }
+    let rect = Rect::new(area.x + 1, area.y + 1, width.min(area.width - 1), height.min(area.height - 1));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).style(box_style()).block(Block::bordered().style(box_style())), rect);
+}
+
+fn legend_lines() -> Vec<Line<'static>> {
+    ui::legend()
+        .into_iter()
+        .map(|(c, name)| {
+            Line::from(vec![
+                Span::styled("\u{2588}\u{2588} ", Style::default().fg(Color::Rgb(c.0, c.1, c.2))),
+                Span::raw(name),
+            ])
+        })
+        .collect()
+}
+
+/// One line beside the mouse pointer.
+fn draw_tooltip(frame: &mut ratatui::Frame, col: u16, row: u16, text: &str) {
+    let area = frame.area();
+    let text = format!(" {text} ");
+    let len = (text.chars().count() as u16).min(area.width);
+    let x = if col + 2 + len <= area.x + area.width { col + 2 } else { (col + 1).saturating_sub(len).max(area.x) };
+    let y = if row + 1 < area.y + area.height { row + 1 } else { row.saturating_sub(1) };
+    let rect = Rect::new(x, y, len, 1);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(text).style(box_style()), rect);
 }
 
 /// The notice box, centred near the top of the pane.
@@ -313,11 +435,9 @@ fn draw_notice(frame: &mut ratatui::Frame, lines: &[String]) {
         return;
     }
     let rect = Rect::new(area.x + (area.width - width) / 2, area.y + 1, width, height);
-    let style = Style::default()
-        .fg(ratatui::style::Color::Rgb(230, 220, 200))
-        .bg(ratatui::style::Color::Rgb(40, 30, 22));
+    let style = box_style();
     frame.render_widget(Clear, rect);
-    let text: Vec<ratatui::text::Line> = lines.iter().map(|l| ratatui::text::Line::from(l.as_str())).collect();
+    let text: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
     frame.render_widget(
         Paragraph::new(text).style(style).centered().block(Block::bordered().style(style)),
         rect,
@@ -334,6 +454,9 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
         show_status,
         reports_seen: 0,
         notice: None,
+        follow: None,
+        hover: None,
+        panel: Panel::None,
         shown_season: sim::Season::Calm { until: 0 },
         fading_from: None,
         fade: 1.0,
@@ -350,17 +473,31 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
                 }
                 app.check_notice();
             }
-            if app.notice.as_ref().is_some_and(|(_, since)| since.elapsed() > NOTICE) {
+            if app.notice.as_ref().is_some_and(|(_, since, stay)| since.elapsed() > *stay) {
                 app.notice = None;
             }
             app.advance_fade();
             terminal.draw(|frame| {
                 let status = app.status(frame.area().width as usize);
                 frame.render_widget(
-                    ui::Colony { world: &app.world, status, fading_from: app.fading_from, fade: app.fade },
+                    ui::Colony {
+                        world: &app.world,
+                        status,
+                        fading_from: app.fading_from,
+                        fade: app.fade,
+                        follow: app.follow,
+                    },
                     frame.area(),
                 );
-                if let Some((lines, _)) = &app.notice {
+                match app.panel {
+                    Panel::Help => draw_panel(frame, HELP.iter().map(|l| Line::from(*l)).collect()),
+                    Panel::Legend => draw_panel(frame, legend_lines()),
+                    Panel::None => {}
+                }
+                if let Some((col, row, text)) = app.tooltip(frame.area()) {
+                    draw_tooltip(frame, col, row, &text);
+                }
+                if let Some((lines, _, _)) = &app.notice {
                     draw_notice(frame, lines);
                 }
             })?;
@@ -391,11 +528,34 @@ fn run(terminal: &mut Term, cfg: Config, speed: u8, show_status: bool) -> io::Re
                     app.world.add_food_at(x);
                 }
                 KeyCode::Char('d') => app.world.force_weather(),
+                KeyCode::Char('w') => {
+                    app.world.water();
+                    app.say("Rain".into());
+                }
+                KeyCode::Char('t') => app.world.tremor(),
+                KeyCode::Char('T') => {
+                    let n = app.world.quake();
+                    app.say(if n == 0 {
+                        "The ground held".into()
+                    } else {
+                        format!("Cave-in: {n} cells of tunnel filled")
+                    });
+                }
+                KeyCode::Char('k') => match app.world.kill_queen() {
+                    Some(l) => app.say(format!("The queen of nest {l} is dead")),
+                    None => app.say("No queen to kill".into()),
+                },
+                KeyCode::Char('s') => app.save_snapshot(),
+                KeyCode::Char('j') => app.panel = if app.panel == Panel::Legend { Panel::None } else { Panel::Legend },
+                KeyCode::Char('?') => app.panel = if app.panel == Panel::Help { Panel::None } else { Panel::Help },
+                KeyCode::Char('0') => app.follow = None,
+                KeyCode::Char(c @ '1'..='9') => app.follow_nest(c as usize - '0' as usize),
                 _ => {}
             },
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
                 app.world.add_food_at(m.column as usize);
             }
+            Event::Mouse(m) if m.kind == MouseEventKind::Moved => app.hover = Some((m.column, m.row)),
             Event::Resize(w, h) => app.rebuild(w, h),
             _ => {}
         }
