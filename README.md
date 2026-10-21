@@ -92,13 +92,29 @@ long it lasted and how many ants and queens were lost since the last one; it clo
 
 ## Install
 
-Needs a Rust toolchain and a terminal with true colour (iTerm2, Ghostty, kitty, WezTerm, …).
+Needs a terminal with true colour (iTerm2, Ghostty, kitty, WezTerm, …).
+
+Homebrew (macOS or Linux):
 
 ```bash
-cargo install --path .
+brew install tom-xlsx/tap/antcolony
 ```
 
-That puts `antcolony` in `~/.cargo/bin`.
+Prebuilt binaries for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64) and Windows are
+on the [releases page](https://github.com/tom-xlsx/antcolony/releases). On macOS and Linux the
+installer script fetches the right one and puts it in `~/.cargo/bin`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tom-xlsx/antcolony/releases/latest/download/antcolony-installer.sh | sh
+```
+
+With a Rust toolchain:
+
+```bash
+cargo install --git https://github.com/tom-xlsx/antcolony
+```
+
+or from a checkout, `cargo install --path .`. Either way `antcolony` ends up in `~/.cargo/bin`.
 
 ## Keys
 
@@ -173,6 +189,23 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo run --release -- --headless 3000 --seed 1
 ```
+
+## Releasing
+
+Releases are built by [cargo-dist](https://axodotdev.github.io/cargo-dist/) from
+`.github/workflows/release.yml` (config in `dist-workspace.toml`). To cut one: bump `version` in
+`Cargo.toml`, commit, then tag and push the tag:
+
+```bash
+git tag v0.8.0 && git push origin master v0.8.0
+```
+
+The workflow builds every target, attaches the archives, checksums and installer script to a
+GitHub release, and pushes an updated `Formula/antcolony.rb` to
+[tom-xlsx/homebrew-tap](https://github.com/tom-xlsx/homebrew-tap). That last step needs a
+`HOMEBREW_TAP_TOKEN` repository secret: a fine-grained personal access token with contents
+read/write on the tap repo. After changing `dist-workspace.toml`, run `dist generate` to
+refresh the workflow, and `dist build` to try a release locally for this machine.
 
 ## Licence
 

@@ -4,6 +4,7 @@ version = "0.7.0"
 edition = "2021"
 description = "An ant colony that lives in a terminal pane"
 license = "MIT"
+homepage = "https://github.com/tom-xlsx/antcolony"
 repository = "https://github.com/tom-xlsx/antcolony"
 
 [dependencies]
@@ -15,3 +16,7 @@ fastrand = "2"
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
